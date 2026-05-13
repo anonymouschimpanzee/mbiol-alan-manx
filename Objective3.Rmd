@@ -1,0 +1,1584 @@
+---
+title: "Objective3"
+output: html_document
+date: "2026-04-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This file explores Objective 3 of the project: To determine whether light levels and ships impact breeding birds and subsequently, chick provisioning behaviour. The file contains processing, analyses and plotting used for the final project write up.
+
+## **Housekeeping**
+
+```{r Install and Load packages}
+
+#General
+require(hms) #Time zone and handling times
+require(dplyr) 
+require(dbplyr)
+require(lubridate)
+require(tidyverse)
+require(suncalc) #Calculates sun and moon elevation, rise and set
+require(stringr)
+
+#Plots
+require(ggplot2) 
+require(patchwork) #Compiling plots
+require(ggeffects)
+require(multcompView)
+
+#Models
+require(glmmTMB)
+require(MASS) #Predictions of linear models (glm.nb)
+require(lme4) #Fit linear and generalised linear mixed models (glmer)
+require(ggfortify) #Plotting of statistics/inspecting residuals
+require(car)
+require(emmeans)
+require(statmod)
+require(betareg) #Beta regression
+
+#Geolocator processing 
+require(GeoLight)
+require(TwGeos)
+require(berryFunctions)
+require(strucchange)
+require(xfun)
+require(data.table)
+require(zoo)
+
+#Mixture Model
+require(plotmm)
+require(mixtools)
+```
+
+## Hypothesis 6
+
+Colony attendance of breeding shearwaters is significantly lower on nights with brighter skies.
+
+#### Step 1: Read in Geolocator files in a usable format ('dark' 'light' 'wet' 'dry')
+
+Due to the data used, I processed two separate read-ins: high resolution and low resolution. They require different code because I reduce the high resolution data down to fit the low resolution so that I can merge them.
+
+Geolocator files are .deg (wet/dry data) and .lux (light/dark data). These both need to be read-in and merged with one another so that I can later find colony visits in the geolocator data.
+
+```{r Low Resolution Read-In}
+########## Low resolution data read-in 
+########## (1) Reading in wet files first (.deg files)
+#Set working directory where GLS files are found 
+datadir <- setwd("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low")
+
+#List all the files in the directory 
+all_files <- list.files(path = datadir)
+
+#Filter for only the .deg files in this directory (these are the appropriate immersion files for my loggers)
+wet_files <- all_files[
+  tolower(file_ext(all_files)) == "deg" &  #Must end with .deg
+    !grepl("driftadj", all_files, ignore.case = TRUE)  #Exclude if "driftadj" appears anywhere
+]
+
+#Split the filename by the '_' character so we can add metadata to the GLS trace
+#The way the lab group name files so that all metadata is included in it
+splits <- strsplit(wet_files, "_")
+
+#Create list of parameters for each file 
+parameter <- list()
+parameter$colony <- sapply(splits, "[[", 1)
+parameter$ring <- sapply(splits, "[[", 2)
+parameter$burrow <- sapply(splits, "[[", 3) %>% 
+  str_remove_all("^b") %>% #Removing b before burrow name
+  str_replace("^GB0+", "GB") #Removing 0 in GB01
+parameter$gls <- sapply(splits, "[[", 4)
+parameter$type <- sapply(splits, "[[", 5)
+
+#Creating parameter for the dates is a bit more complicated
+dates <- sapply(splits, "[", 6) %>%
+  str_remove_all('.deg') #Removing file name extension .deg to leave just the date
+
+#Creating characters for year, month and day
+yrs <- NA
+mns <- NA
+dys <- NA
+
+#Get the filename date into a usable format
+for (i in 1:length(dates)) {
+  if (nchar(dates[i]) == 8) {
+    
+    #Is year first?
+    if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) != "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      #Is year second?
+    } else if (substr(dates[i],1,2) != "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],5,8) 
+      mn <- substr(dates[i],3,4)
+      dy <- substr(dates[i],1,2) 
+      
+      #Is it hard to tell?
+    } else if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- substr(dates[i],5,8) 
+        mn <- substr(dates[i],3,4)
+        dy <- substr(dates[i],1,2)  
+      }
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- NA
+        mn <- NA
+        dy <- NA
+      }
+      
+    }
+    
+  } else if (nchar(dates[i]) == 11) {
+    yr <- NA
+    mn <- NA
+    dy <- NA
+  }
+  
+  yrs[i] <- yr
+  mns[i] <- mn
+  dys[i] <- dy
+  
+}
+parameter$year <- yrs
+parameter$month <- mns
+parameter$day <- dys
+
+#Create a data frame for these parameters
+parameter <- data.frame(parameter)
+
+#Create a list to collect these parameter data frames for each file
+coord_files <- list()
+
+##Read-in loop
+for (i in seq_along(wet_files)) {
+  
+  #Read in the files
+  #z <- read.csv(paste(datadir, wet_files[i], sep = ''), skip = 19, sep = '')
+  z <- tryCatch(
+    read.csv(file.path(datadir, wet_files[i]), skip = 19, sep = '', stringsAsFactors = FALSE),
+    error = function(e) {
+      warning(sprintf("Failed to read %s: %s", wet_files[i], e$message))
+      return(NULL)
+    }
+  )
+  
+  #Skip if read failed
+  if (is.null(z)) next
+  
+  #Skip if zero rows
+  if (nrow(z) == 0) {
+    warning(sprintf("File %s read OK but has 0 rows — skipping.", wet_files[i]))
+    next
+  }
+  
+  #Combine date and time column
+  z$DD.MM.YYYY <- paste(z$DD.MM.YYYY,z$HH.MM.SS)
+  
+  #Remove column 2 (the time column is no longer required)
+  z[2] <- NULL
+  
+  #Rename columns to "POSIXct" (datetime) and (immersion) "score"
+  names(z)[1] <- "POSIXct"
+  names(z)[2] <- "score"
+  
+  #Convert date column to a time object (POSIXct format)
+  z$POSIXct <- as.POSIXct(z$POSIXct, format = "%d/%m/%Y %H:%M:%OS", 'GMT')
+  
+  #Store this information as the first item in the list
+  coord_files[[i]] <- z
+  
+  #Add columns for colony, ring, burrow, gls and file_year (all from the filename metadata), and also for season (taken as the year section of the POSIXct column)
+  coord_files[[i]]$colony <- parameter$colony[i]
+  coord_files[[i]]$ring <- parameter$ring[i]
+  coord_files[[i]]$burrow <- parameter$burrow[i]
+  coord_files[[i]]$gls <- str_remove_all(parameter$gls[i], "gls")
+  coord_files[[i]]$file_year <- parameter$year[i]
+  coord_files[[i]]$season <- format(coord_files[[i]]$POSIXct, "%Y")
+  
+  #Check that this has worked by printing each iteration number and the number of columns
+  print(paste(i,ncol(coord_files[[i]])))
+}
+
+#Bind this list into a single data table
+wetdatalowres <- rbindlist(coord_files, fill = TRUE)
+
+#Create identifier title based on year and ring number?
+wetdatalowres$title <- paste(wetdatalowres$ring, wetdatalowres$season, sep = ".")
+
+#Save this data as an R object
+write.csv(wetdatalowres, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/wetdatalow.csv")
+
+########## (2) Read in light data files 
+#Filter for only the .lux files in this directory
+light_files <- all_files[
+  tolower(file_ext(all_files)) == "lux" &  # must end with .lux
+    !grepl("driftadj", all_files, ignore.case = TRUE)  # exclude if "driftadj" appears anywhere
+]
+
+##Split the filename by the '_' character so we can add metadata to the GLS trace
+splits <- strsplit(light_files, 
+                   "_")
+
+#Create list of parameters for each file 
+parameter <- list()
+parameter$colony <- sapply(splits, "[[", 1)
+parameter$ring <- sapply(splits, "[[", 2)
+parameter$burrow <- sapply(splits, "[[", 3)
+parameter$gls <- sapply(splits, "[[", 4)
+parameter$type <- sapply(splits, "[[", 5)
+
+#The "b" part of the burrow split may need to be removed - and also the 0 from GB01
+parameter$burrow <- str_remove_all(parameter$burrow, '^b')
+parameter$burrow <- stringr::str_replace(parameter$burrow, "^GB0+", "GB")
+
+#Creating parameter for the dates is a bit more complicated
+dates <- sapply(splits, "[", 6)
+
+#Removing the file name extension from the date parameter
+dates <- str_remove_all(dates, '.lux')
+substr(dates,1,2)
+
+yrs <- NA
+mns <- NA
+dys <- NA
+
+#Get the filename date into a usable format
+for (i in 1:length(dates)) {
+  if (nchar(dates[i]) == 8) {
+    
+    # is the year first?
+    if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) != "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      # is year second?
+    } else if (substr(dates[i],1,2) != "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],5,8) 
+      mn <- substr(dates[i],3,4)
+      dy <- substr(dates[i],1,2) 
+      
+      # is it hard to tell?
+    } else if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- substr(dates[i],5,8) 
+        mn <- substr(dates[i],3,4)
+        dy <- substr(dates[i],1,2)  
+      }
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- NA
+        mn <- NA
+        dy <- NA
+      }
+      
+    }
+    
+  } else if (nchar(dates[i]) == 11) {
+    yr <- NA
+    mn <- NA
+    dy <- NA
+  }
+  
+  yrs[i] <- yr
+  mns[i] <- mn
+  dys[i] <- dy
+}
+
+parameter$year <- yrs
+parameter$month <- mns
+parameter$day <- dys
+
+#Create a data frame for these parameters
+parameter <- data.frame(parameter)
+
+#Create a list to collect these parameter data frames for each file
+coord_files <- list()
+
+#Read-in loop
+for (i in seq_along(light_files)) {
+  
+  # read in the files (using the readMTlux function from the TwGeos package)  #install.packages("devtools") devtools::install_github("slisovski/TwGeos")
+  z <- readMTlux(file.path(datadir, light_files[i]))
+
+  # omit any NAs
+  z <- na.omit(z)
+  
+  # rename the date/time column to "POSIXct"
+  names(z)[1] <- "POSIXct"
+  
+  # store this information as the first item in the list
+  coord_files[[i]] <- z
+  
+  # add metadata from the filename
+  coord_files[[i]]$colony <- parameter$colony[i]
+  coord_files[[i]]$ring <- parameter$ring[i]
+  coord_files[[i]]$burrow <- parameter$burrow[i]
+  coord_files[[i]]$gls <- str_remove_all(parameter$gls[i], "gls")
+  coord_files[[i]]$file_year <- parameter$year[i]
+  coord_files[[i]]$season <- format(coord_files[[i]]$POSIXct, "%Y")
+  
+  # check that this has worked by printing each iteration number and the number of columns
+  print(paste(i, ncol(coord_files[[i]])))
+}
+
+#Bind this list into a single data table
+lightdata <- rbindlist(coord_files, fill = TRUE)
+
+#Save this as an R object
+write.csv(lightdata, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/lightdatalow.csv")
+
+########## (3) Merge wet and light data 
+#Read in data files 
+lightlow <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/lightdatalow.csv")
+wetlow <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/wetdatalow.csv")
+
+#Check colnames
+colnames(lightlow)
+colnames(wetlow)
+
+#Make sure colnames are the same and datetime in POSIXct 
+wetlow$POSIXct <- as.POSIXct(wetlow$POSIXct, format = "%Y-%m-%d %H:%M:%S")
+lightlow$POSIXct <- as.POSIXct(lightlow$POSIXct, format = "%Y-%m-%d %H:%M:%S")
+
+#Merge based on title, POSIXct, colony, file_year, 
+lightwet.datalow <- merge(lightlow, wetlow, by = c("POSIXct", "colony", "ring", "burrow", "gls", "file_year"), all = T)
+
+#Can check that this does indeed contain Light and immersion (score) data
+hist(lightwet.datalow$Light)
+hist(lightwet.datalow$score)
+
+#Check that all the rings are present (there should be 15)
+unique(lightwet.datalow$ring)
+
+#Save this 
+write.csv(lightwet.datalow, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/lightwet_datalow.csv")
+```
+
+```{r High Resolution Read-In}
+########## High Resolution 
+########## (1) Wet data 
+datadirhigh <- setwd("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high")
+
+wet_files_high <- list.files(path = datadirhigh) %>%
+  tolower() %>% 
+  .[file_ext(.) == "deg" & !grepl("driftadj", ., ignore.case = TRUE)] #Must end with .deg and exclude if "driftadj" appears anywhere
+
+splitshigh <- strsplit(wet_files_high, "_")
+
+parameterhigh<-list()
+parameterhigh$colony <- sapply(splitshigh, "[[", 1)
+parameterhigh$ring <- sapply(splitshigh, "[[", 2)
+parameterhigh$burrow <- sapply(splitshigh, "[[", 3) %>% 
+  str_remove_all("^b") %>% #Removing b before burrow name
+  str_replace("^GB0+", "GB") #Removing 0 in GB01
+parameterhigh$gls <- sapply(splitshigh, "[[", 4)
+parameterhigh$type <- sapply(splitshigh, "[[", 5)
+
+#Creating parameter for the dates is a bit more complicated
+dateshigh <- sapply(splitshigh, "[", 6) %>%
+  str_remove_all('.deg') #Removing file name extension .deg to leave just the date
+
+#Creating characters for year, month and day
+yrs <- NA
+mns <- NA
+dys <- NA
+
+#Get the filename date into a usable format
+for (i in 1:length(dateshigh)) {
+  if (nchar(dateshigh[i]) == 8) {
+    
+    #Is year first?
+    if (substr(dateshigh[i],1,2) == "20" & substr(dateshigh[i],5,6) != "20") {
+      yr <- substr(dateshigh[i],1,4) 
+      mn <- substr(dateshigh[i],5,6)
+      dy <- substr(dateshigh[i],7,8) 
+      
+      #Is year second?
+    } else if (substr(dateshigh[i],1,2) != "20" & substr(dateshigh[i],5,6) == "20") {
+      yr <- substr(dateshigh[i],5,8) 
+      mn <- substr(dateshigh[i],3,4)
+      dy <- substr(dateshigh[i],1,2) 
+      
+      #Is it hard to tell?
+    } else if (substr(dateshigh[i],1,2) == "20" & substr(dateshigh[i],5,6) == "20") {
+      yr <- substr(dateshigh[i],1,4) 
+      mn <- substr(dateshigh[i],5,6)
+      dy <- substr(dateshigh[i],7,8) 
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- substr(dateshigh[i],5,8) 
+        mn <- substr(dateshigh[i],3,4)
+        dy <- substr(dateshigh[i],1,2)  
+      }
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- NA
+        mn <- NA
+        dy <- NA
+      }
+      
+    }
+    
+  } else if (nchar(dateshigh[i]) == 11) {
+    yr <- NA
+    mn <- NA
+    dy <- NA
+  }
+  
+  yrs[i] <- yr
+  mns[i] <- mn
+  dys[i] <- dy
+  
+}
+
+parameterhigh$year <- yrs
+parameterhigh$month <- mns
+parameterhigh$day <- dys
+
+#Create a data frame for these parameters
+parameterhigh <- data.frame(parameterhigh)
+
+#Create a list to collect these parameter data frames for each file
+coord_files_high <- list()
+
+#VIN2RIN function needed for high res read in 
+vin2rin <- function(input){
+temp_df <-zhigh[which(is.na(zhigh$big.number) == F),]
+zhigh$big.number <- as.character(zhigh$big.number)
+zhigh$big.number <- as.numeric(zhigh$big.number)
+reversal <- data.frame(zhigh$big.number, temp_df$state)
+expansion <- reversal[rep(row.names(reversal),reversal$zhigh.big.number), 2]
+
+chunks <- split(expansion, ceiling(seq_along(expansion)/300))
+
+wet_freq <- plyr::ldply(chunks, function(c) sum(c=="wet"))
+dry_freq <- plyr::ldply(chunks, function(c) sum(c=="dry"))
+
+#Check to determine start time direction
+forwardStt <- temp_df$POSIXct[1]
+forwardCheck <- temp_df$POSIXct[1] + zhigh$big.number[1]
+backwardStt <- temp_df$POSIXct[1] - zhigh$big.number[1]
+forwardDate <- strsplit(as.character(forwardCheck), split = " ")
+forwardDate <- forwardDate[[1]][1]
+
+sttime <- ifelse(forwardDate == as.Date(temp_df$POSIXct[[2]]), as.character(forwardStt), as.character(backwardStt))
+sttime <- as.POSIXct(sttime, format = "%Y-%m-%d %H:%M:%S", 'GMT')
+
+forwardendtime <- tail(temp_df$POSIXct, n =1)+tail(zhigh$big.number, n = 1)
+backendtime <- tail(temp_df$POSIXct, n =1)
+
+endtime <- ifelse(forwardDate == as.Date(temp_df$POSIXct[[2]]), as.character(forwardendtime), as.character(backendtime))
+endtime <- as.POSIXct(endtime, format = "%Y-%m-%d %H:%M:%S", 'GMT')
+
+outlength <- ceiling(sum(zhigh$big.number)/300)
+POSIXct <- seq.POSIXt(sttime, by = "300 secs", length.out = outlength)
+POSIXct <- as.data.frame(POSIXct)
+
+dry <- dry_freq$V1
+wet <- wet_freq$V1
+
+minbins <- as.data.frame(cbind(POSIXct, wet, dry))
+
+minbins <- minbins[-nrow(minbins),]  
+
+fullset <- minbins
+fullset$length <- fullset$wet/3
+fullset$length <- round(fullset$length)
+fullset$dry <- NULL
+fullset$wet <- NULL
+fullset$status <- 'HIGHRES'
+fullset$exceltime <- NA
+
+colnames(fullset)[1] <- 'datetime'
+return(fullset)
+}
+
+#Read-in loop
+for (i in seq_along(wet_files_high)) {
+  
+  # read in the files
+  zhigh <- tryCatch(
+    read.csv(file.path(datadirhigh, wet_files_high[i]), skip = 19, sep = '', stringsAsFactors = FALSE),
+    error = function(e) {
+      warning(sprintf("Failed to read %s: %s", wet_files_high[i], e$message))
+      return(NULL)
+    }
+  )
+    
+    names(zhigh)[1] <- "POSIXct"
+    names(zhigh)[2] <- "time"
+    names(zhigh)[3] <- "big.number"
+    names(zhigh)[4] <- "state"
+    #rename columns
+    #if already summed into ten min bins
+   
+     #Combine date and time column
+    zhigh$POSIXct <- paste(zhigh$POSIXct,zhigh$time)
+    
+    # remove column 2 (the time column is no longer required)
+    zhigh[2] <- NULL
+    
+    # convert date column to a time object (POSIXct format)
+    zhigh$POSIXct <- as.POSIXct(zhigh$POSIXct, format = "%d/%m/%Y %H:%M:%OS", 'GMT')
+  
+    zhigh<-vin2rin(zhigh)
+    
+    #convert date column to a time object specifying the input format or it gets confused
+    coord_files_high[[i]] <- zhigh
+  
+  # add metadata from the filename
+  coord_files_high[[i]]$colony <- parameterhigh$colony[i]
+  coord_files_high[[i]]$ring <- parameterhigh$ring[i]
+  coord_files_high[[i]]$burrow <- parameterhigh$burrow[i]
+  coord_files_high[[i]]$file_year <- parameterhigh$year[i]
+  coord_files_high[[i]]$gls <- str_remove_all(parameterhigh$gls[i], "gls")
+
+  # add an identifier
+  coord_files_high[[i]]$trackID <- i
+  
+  print(paste(i,ncol(coord_files_high[[i]])))
+}
+
+#Bind this list into a single data table
+wetdatahighres <- rbindlist(coord_files_high, fill = TRUE)
+
+#Create identifier title based on year and ring number?
+wetdatahighres$title <- paste(wetdatahighres$ring, wetdatahighres$file_year, sep = ".")
+
+#Save this data as an R object
+write.csv(wetdatahighres, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/wetdatahigh.csv")
+
+########## (2) Light data 
+all_files <- list.files(path = datadirhigh)
+
+#Filter for only the .lux files
+light_files_high <- all_files[
+  tolower(file_ext(all_files)) == "lux" &  # must end with .lux
+    !grepl("driftadj", all_files, ignore.case = TRUE)  # exclude if "driftadj" appears anywhere
+]
+
+##Split the filename by the '_' character so we can add metadata to the GLS trace
+splits <- strsplit(light_files, 
+                   "_")
+
+#Create list of parameters for each file 
+parameter <- list()
+parameter$colony <- sapply(splits, "[[", 1)
+parameter$ring <- sapply(splits, "[[", 2)
+parameter$burrow <- sapply(splits, "[[", 3)
+parameter$gls <- sapply(splits, "[[", 4)
+parameter$type <- sapply(splits, "[[", 5)
+
+#The "b" part of the burrow split may need to be removed - and also the 0 from GB01
+parameter$burrow <- str_remove_all(parameter$burrow, '^b')
+parameter$burrow <- stringr::str_replace(parameter$burrow, "^GB0+", "GB")
+
+#Creating parameter for the dates is a bit more complicated
+dates <- sapply(splits, "[", 6)
+
+#Removing the file name extension from the date parameter
+dates <- str_remove_all(dates, '.lux')
+substr(dates,1,2)
+
+yrs <- NA
+mns <- NA
+dys <- NA
+
+#Get the filename date into a usable format
+for (i in 1:length(dates)) {
+  if (nchar(dates[i]) == 8) {
+    
+    # is the year first?
+    if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) != "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      # is year second?
+    } else if (substr(dates[i],1,2) != "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],5,8) 
+      mn <- substr(dates[i],3,4)
+      dy <- substr(dates[i],1,2) 
+      
+      # is it hard to tell?
+    } else if (substr(dates[i],1,2) == "20" & substr(dates[i],5,6) == "20") {
+      yr <- substr(dates[i],1,4) 
+      mn <- substr(dates[i],5,6)
+      dy <- substr(dates[i],7,8) 
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- substr(dates[i],5,8) 
+        mn <- substr(dates[i],3,4)
+        dy <- substr(dates[i],1,2)  
+      }
+      
+      if (as.numeric(mn) < 4 | as.numeric(mn) > 10) {
+        yr <- NA
+        mn <- NA
+        dy <- NA
+      }
+      
+    }
+    
+  } else if (nchar(dates[i]) == 11) {
+    yr <- NA
+    mn <- NA
+    dy <- NA
+  }
+  
+  yrs[i] <- yr
+  mns[i] <- mn
+  dys[i] <- dy
+}
+
+parameter$year <- yrs
+parameter$month <- mns
+parameter$day <- dys
+
+#Create a data frame for these parameters
+parameter <- data.frame(parameter)
+
+#Create a list to collect these parameter data frames for each file
+coord_files <- list()
+
+#Read-in loop!
+for (i in seq_along(light_files)) {
+  
+  # read in the files (using the readMTlux function from the TwGeos package)  #install.packages("devtools") devtools::install_github("slisovski/TwGeos")
+  z <- readMTlux(file.path(datadir, light_files[i]))
+  
+  # omit any NAs
+  z <- na.omit(z)
+  
+  # rename the date/time column to "POSIXct"
+  names(z)[1] <- "POSIXct"
+  
+  # store this information as the first item in the list
+  coord_files[[i]] <- z
+  
+  # add metadata from the filename
+  coord_files[[i]]$colony <- parameter$colony[i]
+  coord_files[[i]]$ring <- parameter$ring[i]
+  coord_files[[i]]$burrow <- parameter$burrow[i]
+  coord_files[[i]]$gls <- str_remove_all(parameter$gls[i], "gls")
+  coord_files[[i]]$file_year <- parameter$year[i]
+  coord_files[[i]]$season <- format(coord_files[[i]]$POSIXct, "%Y")
+  
+  # check that this has worked by printing each iteration number and the number of columns
+  print(paste(i, ncol(coord_files[[i]])))
+}
+
+#Bind this list into a single data table
+lightdata <- rbindlist(coord_files, fill = TRUE)
+
+#Create identifier title based on year and ring number
+lightdata$title <- paste(lightdata$ring, lightdata$season, sep = ".")
+
+#Save this as an csv
+write.csv(lightdata, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/lightdatahigh.csv")
+
+########## (3) Merge wet and light data
+#Read in files created above
+wet <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/wetdatahigh.csv")
+light <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/lightdatahigh.csv")
+
+#Make sure they have the same col names
+colnames(wet) 
+colnames(light)
+
+#Ensure POSIXct in same format 
+#Burrow names and ring nummbers are lower and upper case - need to make consistent 
+wet <- wet %>%
+  mutate(
+    POSIXct = as.POSIXct(datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    ring    = recode(ring,
+                     em35000 = "EM35000",
+                     em55662 = "EM55662",
+                     ea05370 = "EA05370"),
+    burrow  = recode(burrow,
+                     `16l` = "16L",
+                     hg16  = "HG16"),
+    gls     = recode(gls,
+                     cl389 = "CL389",
+                     cl407 = "CL407",
+                     ce989 = "CE989"))
+
+light <- light %>%
+  mutate(
+    POSIXct = as.POSIXct(POSIXct, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
+
+lightwet.datahigh <- merge(light, wet, by = c("POSIXct", "ring", "burrow", "file_year", "gls", "colony"), all = T)
+
+#Can check that this does indeed contain Light and immersion (score) data
+hist(lightwet.datahigh$Light)
+hist(lightwet.datahigh$length)
+
+#Check that all the rings are present that you intend 
+unique(lightwet.datahigh$ring)
+
+#Save this so light and wet data are all together 
+write.csv(lightwet.datahigh, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/lightwet_datahigh.csv")
+```
+
+```{r Merge High Resolution and Low Resolution Data}
+#Get both files saved above: low res wet and light, high res wet and light
+lowres <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/low/lightwet_datalow.csv")
+highres <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/high/lightwet_datahigh.csv")
+
+#Check ring numbers in each
+unique(lowres$ring)
+unique(highres$ring)
+
+#Check colnames - are they the EXACT same 
+colnames(lowres)
+colnames(highres)
+
+#Remove columns I dont need and adding ones so they match
+lowres <- lowres[ , !(names(lowres) %in% c("X", "X.x", "season.y", "X.y")) ]
+highres <- highres[ , !(names(highres) %in% c("X.1", "X", "exceltime", "datetime", "trackID", "n_obs", "lux_median", "lux_sum", "X.y", "X.x")) ]
+lowres$status <- "LOWRES"
+highres$season <- highres$file_year
+
+#Renaming columns so they are the same (need matching for row binding)
+names(highres)[names(highres) == "Light"] <- "lux"
+names(highres)[names(highres) == "length"]   <- "wet_score"
+names(lowres)[names(lowres) == "Light"]   <- "lux"
+names(lowres)[names(lowres) == "score"]   <- "wet_score"
+names(lowres)[names(lowres) == "season.x"]   <- "season"
+
+#Combine
+all <- rbind(lowres, highres)
+
+#Save to directory 
+write.csv(all, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/all.csv")
+```
+
+#### Step 2: Classify Colony Visitation ('dark' and 'dry' periods)
+
+```{r Housekeeping for Geolocator Data}
+#Load GLS data
+data <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/Processed Files/all.csv")
+
+#Inspect
+hist(data$lux)
+hist(data$wet_score)
+plot(data$lux, data$wet_score)
+
+#Remove geolocator data when the loggers were not on the birds
+#Period between when data was taken from from bird and when it was downloaded is removed
+
+#Get dates when Geolocators were on (fieldwork book)
+GLSdiary <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/GLSdiary.csv")
+
+#Use POSIXct for dates and times
+#Deploy = put on bird, Retrieval = taken off bird
+GLSdiary$Deploy.POSIXct <- paste(GLSdiary$Attached.Date, GLSdiary$Attached.time..approx.)
+GLSdiary$Deploy.POSIXct <- as.POSIXct(GLSdiary$Deploy.POSIXct, format = "%d/%m/%Y %H:%M:%S", tz = "UTC")
+
+GLSdiary$Retrieval.POSIXct <- paste(GLSdiary$Retrieval.Date.from.bird, GLSdiary$Retrieval.time.from.bird)
+GLSdiary$Retrieval.POSIXct <- as.POSIXct(GLSdiary$Retrieval.POSIXct, format = "%d/%m/%Y %H:%M:%S", tz = "UTC")
+
+#Are Deploy/Retrieval times missing?
+table(is.na(GLSdiary$Deploy.POSIXct))
+table(is.na(GLSdiary$Retrieval.POSIXct))
+
+#Join to the GLS wet and light data based on ring number (excat deployment and retrieval for each bird)
+#First need to change name of ring to same to match them
+names(GLSdiary)[names(GLSdiary) == "Ring"] <- "ring"
+
+data<- data %>%
+  left_join(
+    GLSdiary %>%
+      select(Deploy.POSIXct, Retrieval.POSIXct, ring),
+    by = "ring")
+
+#Check after your left_join, how many rows lost per ring?
+joined_summary <- data %>% group_by(ring) %>%
+  summarize(n_rows = n(),
+            n_na_deploy = sum(is.na(Deploy.POSIXct)),
+            n_na_retrieval = sum(is.na(Retrieval.POSIXct)))
+print(joined_summary)
+
+#Rings in your joined_summary with all NA deploy/retrieval
+bad_rings <- joined_summary %>% filter(n_na_deploy == n_rows | n_na_retrieval == n_rows) %>% pull(ring)
+bad_rings
+
+#Show a quick count
+length(bad_rings)
+
+#Remove rows that are before the last deployment and after the first retrieval
+#To ensure the same sample size for whole duration
+#Last deployment was 2025-07-15 at 1:15am (AF47, EA05386)
+#First retrieval was 2025-08-08 01:43am (426, EM91278)
+data <- data %>%
+  filter(
+    POSIXct >= "2025-07-15 01:15:00" &
+      POSIXct <= "2025-08-08 01:43:00")
+
+#Only keep dates within deployment and retrieval 
+data <- data %>%
+  filter(POSIXct >= Deploy.POSIXct & POSIXct <= Retrieval.POSIXct)
+
+#Check how many unique rings before and after filtering
+#See how many are lost and why 
+length(unique(read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/Processed Files/all.csv")$ring))
+length(unique(data$ring))
+
+#6 rings lost only - This is fine because they are outside when the Sky Quality Meter was deployed so not used in this study
+#"EA59292" "EJ99646" "EM55664" "EM55768" "EM55771" "EY07308"
+length(unique(GLSdiary$ring))
+```
+
+```{r Extract Dry and Wet, Light and Dark}
+#Extract dates we have geolocators on for
+skomerdates<- as.Date(format(as.POSIXct(data$POSIXct, "%Y-%m-%d", tz = "UTC") ) )
+
+#Get sunset and sunrise for these dates
+sun_skomer<-getSunlightTimes(date=skomerdates, lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset"))
+data <- cbind(data, sun_skomer)
+
+#Make sure all columns are POSIXct format
+data$sunrise  <- as.POSIXct(data$sunrise, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+data$sunset   <- as.POSIXct(data$sunset, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+data$POSIXct <- as.POSIXct(data$POSIXct, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+#Check any NA sunrise/sunset now:
+cat("NA sunrise rows:", sum(is.na(data$sunrise)), "NA sunset rows:", sum(is.na(data$sunset)), "\n")
+
+#Get rid of columns don't need 
+data <- subset(data, select = -c(date, X, lat, lon))
+
+#Define day and night
+data <- data %>%
+  mutate(daynight = case_when(
+    is.na(sunrise) | is.na(sunset) ~ NA_character_,
+    POSIXct >= sunrise & POSIXct <= sunset ~ "Day",
+    TRUE ~ "Night"))
+
+#Check counts per ring and per day/night
+summary_table <- data %>%
+  group_by(ring, daynight) %>%
+  summarise(n_rows = n()) %>% ungroup()
+print(head(summary_table, 20))
+
+#How many rings have ANY Night rows? ANY Day rows? Should have 47 rings still!
+rings_with_night <- summary_table %>% filter(daynight=="Night") %>% pull(ring) %>% unique()
+rings_with_day   <- summary_table %>% filter(daynight=="Day")   %>% pull(ring) %>% unique()
+cat("Rings with Night rows:", length(rings_with_night), "  Rings with Day rows:", length(rings_with_day), "\n")
+
+#Create column of numbers for changes in state from day/night to create an ID number
+data<-  data%>%
+  mutate(
+    change = case_when(
+      daynight != lag(daynight) ~ TRUE,
+      TRUE ~ FALSE),
+    n_change = cumsum(change))
+
+#Create ID for night and day number 
+data$daynight.id<- paste(data$daynight, data$n_change, sep=".")
+
+#Calculate the time difference between rows so we can sum times for mixture model (for when we have data of lots of different time periods)
+data<- split(data, data$ring) #Split data so that the loop runs on every ring number
+for (i in 1:length(data)){
+  infile = data[[i]] 
+  
+  infile<-infile %>%  
+    mutate(timediff= c(0, difftime(infile$POSIXct[-length(infile$POSIXct)], infile$POSIXct[-1], unit = "mins"))) #Gives the time gap between successive rows in minutes
+  infile$timediff[1]<- infile$timediff[2] #First row doesnt have a time diff so instead of being 0, it is the same as the second row 
+  
+  data[[i]]<- infile
+  print(i) #Should have number same as number of rings you have
+}
+
+data<- bind_rows(data)
+data$timediff<- abs(data$timediff)
+
+#If any weird negatives, inspect:
+if(any(data$timediff < 0, na.rm=TRUE)) cat("Warning: negative timediff present\n")
+
+#Seperate nights from days (what we are interested in)
+nights<- filter(data, data$daynight=="Night")
+
+#Count number of bins with wet count - if score is more than 1 then wet, if not then dry
+nights$wet<- with(nights, ifelse(wet_score >= 1 , "Wet", "Dry"))
+
+#Sum the length of each night by adding the time different between rows 
+countspernight<-aggregate(x = nights$timediff,                # Specify data column
+                          by = list(nights$daynight.id),              # Specify group indicator
+                          FUN = sum)
+
+#Count number of wet or dry events per night
+scorepernight<-nights%>%
+  group_by(daynight.id, wet) %>% #Groups data by the night and also by wet or dry within that night
+  select(wet)  %>%
+  dplyr::count() #Counts how many dry or how many wet in that night 
+
+#Join length of night and count data per night
+#Creates a dry and wet column for each night ID so they are not duplicates
+scorepernight <-scorepernight%>% 
+  pivot_wider(names_from=wet, values_from=n)
+#Where there is NA, put 0 (because NA is where there is no wet or dry count)
+scorepernight[is.na(scorepernight)] <- 0
+
+#Remove other columns to get wetcount only 
+wetcountonly <- scorepernight[-c(1:2)]
+names(wetcountonly)[1]<- "wetscore"
+wetcountonly<- cbind(countspernight, wetcountonly)
+
+#Plot a histogram 
+par(mfrow=c(1,1))
+hist(wetcountonly$wetscore, xlab=
+       "Number of Wet Bins per Night", breaks=30, main="", col="Dark grey")
+```
+
+```{r Mixture Model}
+#Run mixture model with EM algorithm to see which nights belong to whcih distribution 
+#Two separate distributions - one for colony visits and one for short boughts of flight 
+
+#Run mix model based on k=2 (Number of components = k, Default = 2)
+m1<-normalmixEM(wetcountonly$wetscore, k=2)
+#Plot density output
+par(mfrow=c(1,1))
+plot(m1, which=2, breaks=30)
+
+if(require(mixtools)){
+  mixmdl <- mixtools::normalmixEM(wetcountonly$wetscore, k = 2)
+}
+x <- mixmdl$x
+x <- data.frame(x)
+ggplot2::ggplot(data.frame(x)) +
+  ggplot2::geom_density(ggplot2::aes(x), color="dark grey", fill="dark grey") +
+  ggplot2::stat_function(geom = "line", fun = plot_mix_comps_normal,
+                         args = list(mixmdl$mu[1], mixmdl$sigma[1], lam = mixmdl$lambda[1]),
+                         colour = "red", linewidth=2) +
+  ggplot2::stat_function(geom = "line", fun = plot_mix_comps_normal,
+                         args = list(mixmdl$mu[2], mixmdl$sigma[2], lam = mixmdl$lambda[2]),
+                         colour = "blue", linewidth=2) +theme_classic()+ xlab("Number of Wet Bins per Night") +ylab("Density")
+
+#mu = vector of component means - mean wet bins for comp 1 and 2
+#sigma - vector component standard deviance 
+#lambda - mixing proportions that sum to 1 (if 0.7, 0.3 then it means 70% of nights in component 1)
+
+#Look at probability that a night belongs to each distribution
+post.df <- as.data.frame(cbind(x = m1$x, m1$posterior))
+
+names(post.df)[2]<- "Col"
+names(post.df)[3]<- "No_Col"
+post.df<- cbind(post.df, wetcountonly)
+names(post.df)[4]<- "daynight.id"
+
+nights<- split(nights, nights$daynight.id)
+
+title<-post.df$daynight.id
+
+#Make sure nights are in right order
+post.df<- split(post.df, post.df$daynight.id)
+title<-names(post.df)
+nights<-nights[title]
+
+for (i in 1 : length (nights)){
+  infile<- nights[[i]]
+  infile2<- post.df[[i]]
+  infile$colprob<- infile2$Col
+  nights[[i]]<- infile
+  name = names(nights[i]) 
+  names(nights)[i]<-name
+  print(i)
+}
+
+#Add in col prob info
+nights<- bind_rows(nights)
+
+#Define day probability of having a colony visit
+days<- filter(data, data$daynight=="Day")
+lux_threshold <- 1.136
+data <- data %>%
+  mutate(wet_flag = ifelse(wet_score >= 1, TRUE, FALSE),
+         state = case_when(
+           daynight == "Day" & (wet_score == 0 & (lux <= lux_threshold)) ~ "Dark_dry",
+           daynight == "Day" ~ "notofcurrentinterest",
+           TRUE ~ NA_character_))
+
+days<- split(days, days$daynight.id)
+for(i in 1:length(days)){
+  infile<- days[[i]]
+  
+  infile<- infile %>%
+    mutate(
+      change = case_when(
+        state != lag(state) ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      n_change = cumsum(change)
+    )                         
+  
+  check<-aggregate(x = infile$timediff,                # Specify data column
+                   by = list(infile$state, infile$n_change),              # Specify group indicator
+                   FUN = sum)
+  
+  if(max(check$x)>=360) {
+    if(check$Group.1[which.max(check$x)]=="notofcurrentinterest"){
+      infile$colprob=0
+    }
+    
+    if(check$Group.1[which.max(check$x)]=="Dark_dry"){
+      infile$colprob=1
+    }
+  }
+  
+  if(max(check$x)<=360){
+    infile$colprob=0
+  }
+  
+  
+  days[[i]]<-infile
+  
+}
+
+##look for long dark periods in the day
+days<- bind_rows(days)
+#days$colprob<- with(days, ifelse(state=="Dark_dry", 1, 0))
+days$state<- NULL
+days$nstate<- NULL
+days$check<- NULL
+nights$wet<-NULL
+#put probability of colony visit at 1 if there is dark_dry during day light
+
+#Combine days and nights
+combined<- rbind(days, nights)
+
+#Create dataset of colony visits
+combined<- combined[order(combined$ring, combined$POSIXct),] 
+#Reorder it so its grouped by ring and time
+
+#Use a threshold to determine if bird is on the colony 
+hist(combined$colprob) 
+#This histogram shows that there are 2 main distributions - clear cut can be made between the two
+
+#Recommend a threshold of 0.8 because my distributions don't overlap too much
+#Increased certainty 
+combined$colony.visit <- with(combined, ifelse(colprob >= 0.8, "Yes", "No"))
+
+#Save this as a csv file 
+write.csv(combined, file = "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/Processed files/colonyvisits.csv")
+```
+
+#### Step 3: Calculate the number of birds arriving each night
+
+```{r Extracting number of birds for each night}
+#Load gls data from above
+glscount <- read.csv( "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/GLS/CountGLS.csv")
+
+#Best nightly metric is how many arrived each night - sum up within a night 
+glsnightly <- glscount %>%
+  group_by(night.of) %>%
+  summarise(
+    n_arrived   = sum(n_individuals_arrived, na.rm = TRUE),
+    mean_natural = mean(illumination, na.rm = TRUE),
+    max_natural = max(illumination, na.rm = TRUE),
+    min_natural = min(illumination, na.rm = TRUE),
+    med_natural = median(illumination, na.rm = TRUE),
+    med_logcdm2 = median(logcdm2, na.rm = TRUE), 
+    mean_logcdm2 = mean(logcdm2, na.rm = TRUE),
+    med_cdm2 = median(cdm2, na.rm = TRUE),
+    mean_cdm2 = mean(cdm2, na.rm = TRUE),
+    mean_moonPhase   = mean(moonPhase, na.rm = TRUE),
+    .groups = "drop")
+
+#Remove date 07/31 - not light data due to being off fieldwork that day 
+glsnightly <- glsnightly[glsnightly$night.of != "2025-07-31", ]
+
+#Combine with ship data too
+ship <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Analysis/analysis/data/shipwide.csv")
+
+#Adding back midnight time stamps and POSIXct
+ship$POSIXct <- as.POSIXct(
+  ifelse(nchar(as.character(ship$POSIXct)) == 10,
+         paste(ship$POSIXct, "00:00:00"),
+         as.character(ship$POSIXct)),
+  format="%Y-%m-%d %H:%M:%S")
+
+#Night.of id
+sun <-getSunlightTimes(date = as.Date(ship$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset"))
+ship <- cbind(ship, sun)
+ship <- subset(ship, select = -c(date, lat, lon))
+#Give night.id again (same as before)
+ship$night.of <- with(ship, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+#Average the heading, distance, number of ships across the night
+shipnightly <- ship %>%
+  group_by(night.of) %>%
+  summarise(
+    avg_heading   = mean(avg_heading, na.rm = TRUE),
+    med_heading = median(avg_heading, na.rm = TRUE),
+    avg_distance = mean(avg_distance_m, na.rm = TRUE),
+    med_distance = median(avg_distance_m, na.rm = TRUE),
+    avg_ship_no = ceiling(mean(no.ships,na.rm = TRUE)),
+    .groups = "drop")
+
+#Bind to the rest of the data 
+allnightly <- glsnightly %>%
+  left_join(shipnightly, by = "night.of")
+
+allnightly <- allnightly[!is.na(allnightly$avg_ship_no), ]
+```
+
+#### Step 4: Model Fitting
+
+```{r Fixed and Random Effects Creation}
+#Days since Start
+allnightly$days_from_start <-as.numeric(as.Date(allnightly$night.of) - min(as.Date(allnightly$night.of), na.rm = TRUE))
+```
+
+```{r Model}
+#Model with natural illumination
+model_full <- glm.nb(n_arrived ~ avg_ship_no + med_logcdm2 + med_natural + days_from_start, data = allnightly)
+summary(model_full)
+
+#Model with only ships
+model_reduced <- glm.nb(n_arrived ~ avg_ship_no + days_from_start, data = allnightly)
+summary(model_reduced)
+```
+
+```{r Plot Full Model}
+#Prediction for logcdm on full model
+newdat_full <- expand.grid(
+  med_logcdm2 = seq(min(allnightly$med_logcdm2, na.rm = TRUE),
+                    max(allnightly$med_logcdm2, na.rm = TRUE),
+                    length.out = 100),
+  avg_ship_no = mean(allnightly$avg_ship_no), na.rm = TRUE,
+  med_natural = mean(allnightly$med_natural), na.rm = TRUE,
+  days_from_start = mean(allnightly$days_from_start), na.rm = TRUE)
+pred_out2 <- predict(model_full, newdat_full, type = "link", se.fit = TRUE, re.form = NA)
+newdat_full$fit_link <- pred_out2$fit
+newdat_full$se_link  <- pred_out2$se.fit
+#95% CI on link scale, then transform back
+newdat_full$pred <- exp(newdat_full$fit_link)
+newdat_full$lwr  <- exp(newdat_full$fit_link - 1.96 * newdat_full$se_link)
+newdat_full$upr  <- exp(newdat_full$fit_link + 1.96 * newdat_full$se_link)
+newdat_full <- newdat_full[, !duplicated(names(newdat_full))]
+
+#Plot cdm2 on full model 
+cdm <- ggplot(allnightly, aes(x = med_logcdm2, y = n_arrived)) +
+  geom_point() +
+  geom_line(data = newdat_full, aes(x = med_logcdm2, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = newdat_full,
+              aes(x = med_logcdm2, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters Arrived",
+    breaks = seq(0, max(allnightly$n_arrived, na.rm = TRUE), by = 5))+
+  coord_cartesian(ylim = c(0, 18)) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+```
+
+```{r Plot Reduced Model}
+#Prediction for ships (reduced model)
+newdat_reduced <- expand.grid(
+  avg_ship_no = seq(min(allnightly$avg_ship_no, na.rm = TRUE),
+                       max(allnightly$avg_ship_no, na.rm = TRUE),
+                       length.out = 100),
+  days_from_start = mean(allnightly$days_from_start), na.rm = TRUE)
+pred_out <- predict(model_reduced, newdat_reduced, type = "link", se.fit = TRUE, re.form = NA)
+newdat_reduced$fit_link <- pred_out$fit
+newdat_reduced$se_link  <- pred_out$se.fit
+#95% CI on link scale, then transform back
+newdat_reduced$pred <- exp(newdat_reduced$fit_link)
+newdat_reduced$lwr  <- exp(newdat_reduced$fit_link - 1.96 * newdat_reduced$se_link)
+newdat_reduced$upr  <- exp(newdat_reduced$fit_link + 1.96 * newdat_reduced$se_link)
+
+#Plot ships on reduced model
+ship <- ggplot(allnightly, aes(x = avg_ship_no, y = n_arrived)) +
+  geom_point() +
+  geom_line(data = newdat_reduced, aes(x = avg_ship_no, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = newdat_reduced,
+              aes(x = avg_ship_no, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters Arrived",
+    breaks = seq(0, max(allnightly$n_arrived, na.rm = TRUE), by = 5))+
+  coord_cartesian(ylim = c(0, 18)) +
+  scale_x_continuous(
+    name = expression("Number of Ships")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+
+#Patching figures together 
+(cdm|ship) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+```
+
+## Hypothesis 7
+
+Chicks are less likely to be fed by adults on nights with brighter skies.
+
+#### Step 1: Extract meal size from chick weights
+
+Chicks were weighed once a day. We factor in metabolic loss into an estimation of nightly meal size, using the equation outlined in the project write-up.
+
+```{r Extract meal size}
+#Load Data
+weights <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Chick Weights/Chickweights.csv")
+
+#POSIXct the check date and time 
+weights$POSIXct <- paste(weights$Check.date, weights$Check.time)
+weights$POSIXct <- as.POSIXct(weights$POSIXct, tz = "UTC", "%d/%m/%Y %H:%M:%OS")
+
+#Weight should be numeric 
+weights$weight.g <- as.numeric(weights$Weight..g.)
+
+#Remove columns not needed 
+weights <- weights[, !(names(weights) %in% c("Weight..g.", "X", "X.1", "X.2", "X.3", "X.4", "X.5", "X.6", "X.7", "X.8", "X.9", "X.10", "X.11", "X.12", "X.13", "X.14", "X.15", "X.16", "X.17", "X.18", "X.19", "X.20"))]
+
+#Remove NAs in POSIXct or Weight
+weights <- weights[!is.na(weights$POSIXct) & !is.na(weights$weight.g), ]
+
+#Apply equation of metabolic loss (r1 x time(hours)) (grouping by burrow and time)
+#Coefficients and SEs
+a_coef <- 2.21e-3
+a_se   <- 0.61e-3
+b_coef <- 1.50
+b_se   <- 0.22
+
+#Compute overnight metabolic loss to the next day's observation for each burrow
+meal_size <- weights %>%
+  arrange(Burrow, POSIXct) %>%
+  group_by(Burrow) %>%
+  mutate(
+    next_POSIXct = lead(POSIXct),
+    next_mass = lead(weight.g),
+    hours   = as.numeric(difftime(next_POSIXct, POSIXct, units = "hours")),
+    initial_mass = weight.g,
+    r1 = a_coef * (initial_mass) + b_coef,
+    metabolic_loss = r1 * hours, 
+    var_a = a_se^2,
+    var_b = b_se^2,
+    se_loss = abs(hours) * sqrt( (initial_mass^2) * var_a + var_b ),
+    ci_lower = metabolic_loss - 1.96 * se_loss,
+    ci_upper = metabolic_loss + 1.96 * se_loss) %>%
+  ungroup() %>%
+  filter(!is.na(hours)) %>%
+  select(Burrow, POSIXct, next_POSIXct, hours, initial_mass, next_mass,
+         metabolic_loss, se_loss, ci_lower, ci_upper)
+
+#Create a column called change in mass 
+meal_size$change_mass <- meal_size$next_mass - meal_size$initial_mass
+
+#Calculate meal size = change_mass + metabolic loss
+meal_size$meal_size <- meal_size$change_mass + meal_size$metabolic_loss
+meal_size$meal_lower <- meal_size$change_mass + meal_size$ci_lower
+meal_size$meal_upper <- meal_size$change_mass + meal_size$ci_upper
+
+```
+
+#### Step 2: Define a feed/no feed
+
+```{r Housekeeping - binding with light and ship data}
+#Combine with light data 
+#Load light data 
+light <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Light/lightpollution_metric.csv")
+
+#Night.of ID
+sun <-getSunlightTimes(date = as.Date(light$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset"))
+light <- cbind(light, sun)
+light <- subset(light, select = -c(date, lat, lon))
+light$night.of <- with(light, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+#Use average light pollution per night as metric 
+light_night <- light %>%
+  group_by(night.of) %>%
+  summarise(
+    avg_lightpoll = mean(lightpollution, na.rm = TRUE),
+    med_lightpoll = median(lightpollution, na.rm = TRUE),
+    moonPhase = median(moonPhase, na.rm = TRUE),
+    med_illumination = median(illumination, na.rm = TRUE), 
+    avg_illumination = mean(illumination, na.rm = TRUE),
+    avg_moonlight = mean(moonlightModel, na.rm = TRUE),
+    med_moonlight = median(moonlightModel, na.rm = TRUE),
+    avg_logcdm2 = mean(logcdm2, na.rm = TRUE),
+    medlogcdm2 = median(logcdm2, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+#Create a night.of ID for chick weights too
+meal_size <- meal_size %>%
+  mutate(night.of = as.Date(POSIXct))
+
+#Bind with chick meals 
+meal_size <- meal_size %>%
+  left_join(light_night, by = "night.of")
+
+#Combine with wide ship data 
+ship <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Light/Ship/Ship.csv")
+#Night.of ID
+sun <-getSunlightTimes(date = as.Date(ship$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset"))
+ship <- cbind(ship, sun)
+ship <- subset(ship, select = -c(date, lat, lon))
+ship$night.of <- with(ship, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+#Average per night.of for heading, distance and number of ships
+ship_night <- ship %>%
+  group_by(night.of) %>%
+  summarise(
+    avg_heading = mean(heading_sk, na.rm = TRUE),
+    avg_distance = mean(distance.metres, na.rm = TRUE),
+    no_ships = max(Number.of.ships, na.rm = TRUE)) %>%
+  ungroup()
+
+#Bind with chick meals 
+meal_size <- meal_size %>%
+  left_join(ship_night, by = "night.of")
+```
+
+```{r Housekeeping - remove outliers}
+#There is a relationship between meal size and hours
+ggplot(data = data,
+       aes(x = hours, y = meal_size))+
+  geom_point(size = 1.0, alpha = 0.8)+
+  geom_smooth(method = "lm", colour = "red") 
+model <- lm(meal_size ~ hours, data = data)
+summary(model)
+
+#Exclude influential points that are creating the relationship 
+#Exclude any with hours above 30 or below 16 
+data_clean <- data[data$hours >= 19 & data$hours <= 30, ]
+model_clean <- lm(meal_size ~ hours, data = data_clean)
+summary(model_clean) #Relationship removed
+ggplot(data = data_clean,
+       aes(x = hours, y = meal_size))+
+  geom_point(size = 1.0, alpha = 0.8)+
+  geom_smooth(method = "lm", colour = "red") 
+```
+
+```{r Binary Feed}
+#Add a column for fed and not fed and any meal size with a negative becomes 0 
+#Any meal sizes that cross 0 in upper and lower bounds = no feed 
+
+#Remove when hours between weighs is more than 40 (this is when the chick was OOR, we forgot etc - too long of a period for the equation to work) 
+
+meal_size <- meal_size %>%
+  mutate(
+    feed = if_else(meal_lower > 0 & meal_upper > 0, "yes", "no")
+  ) %>%
+  filter(hours < 40)
+
+#### Binary yes or no feed
+#Plot to show which feeds were classified as 0 earlier (In)
+ggplot(data_clean, aes(x = hours, y = meal_size, color = feed)) +
+  geom_linerange(aes(ymin = meal_lower, ymax = meal_upper), alpha = 0.3, linewidth = 0.6) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40")+
+  scale_colour_manual(
+    name   = "Feed condition",
+    values = c("no" = "red", "yes" = "grey50"),
+    labels = c("Unfed", "Fed")) +
+  scale_x_continuous(
+    name = "Time between weighs (hours)",
+    breaks = seq(0, max(data_clean$hours, na.rm = TRUE), by = 2)) +
+  scale_y_continuous(
+    name = "Meal size (g)",
+    breaks = pretty(data_clean$meal_size)) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12),
+    legend.title = element_text(size = 13),
+    legend.text  = element_text(size = 12))
+
+#Save
+write.csv(meal_size, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Chick Weights/mealsize.csv", row.names = FALSE)
+```
+
+#### Step 3: Fit a binomial regression
+
+```{r Binomial Regression}
+#Convert yes and no to 1 and 0
+data_clean$feed_binary <- ifelse(data_clean$feed == "yes", 1, 0)
+
+#Diagnostic Plot 
+m <- lm(feed_binary ~ medlogcdm2, data=data_clean )
+data_clean %>% mutate(yhat = predict(m)) %>%
+  ggplot(aes(x=medlogcdm2, y=feed_binary)) + 
+  geom_point() +
+  geom_line(aes(y=yhat), color='red')
+
+#Glm binomial model to define successes and failures
+m1 <- glmer(cbind(feed_binary, 1-feed_binary) ~ medlogcdm2 + chick_age + (1|Burrow) + (1 | night.of), data=data_clean, family=binomial ) 
+summary(m1)
+
+#Get predictions 
+emmeans(m1, ~medlogcdm2, at=list(medlogcdm2=1), type='response')
+
+#Plot a graph
+yhat.df <- emmeans(m1, ~medlogcdm2, at=list(medlogcdm2=seq(-3.572576, -1.794576,by=.01)), type='response') %>%
+  as.data.frame()
+
+ggplot(data_clean, aes(x=medlogcdm2)) +
+  geom_ribbon(data=yhat.df, aes(ymin=asymp.LCL, ymax=asymp.UCL), fill='salmon', alpha=.4) +
+  geom_line( data=yhat.df, aes(y=prob), color='red') +
+  geom_point(aes(y=feed_binary)) +
+  labs(y='Probability of Feed', x='Light levels (CDM2)')
+
+#Plot of binomial regression
+probcdm <- ggplot(data_clean, aes(x = medlogcdm2, y = feed_binary)) +
+  stat_summary_bin(fun = mean, bins = 20, geom = "point", size = 1.5) +
+  stat_smooth(method = "glm",
+              method.args = list(family = "binomial"),
+              se = TRUE,
+              color = "blue",
+              size = 1.2) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))"))+
+  scale_y_continuous(
+    name = "Probability of Feed") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12),
+    legend.position = "none")
+```
+
+```{r Odds ratio}
+#Odds Ratio = compares the likelihood of an outcome occuring in 2 groups 
+#OR = 1 = no effect
+#OR >1 = increased odds
+#OR <1 = decreased odds
+
+#Extract fixed effects estimate and SE for medlogcdm2
+beta <- fixef(m1)["medlogcdm2"] #Before exponentiating (-0.42 negative so feeding odds decrease)
+se   <- sqrt(vcov(m1)["medlogcdm2","medlogcdm2"]) #sqrt of variance = standard error 
+
+# Odds ratio data
+df_or <- data.frame(
+  term  = "medlogcdm2",
+  or    = exp(beta),
+  lower = exp(beta - 1.96 * se),
+  upper = exp(beta + 1.96 * se))
+
+#Odds ratio plot
+boxcdm <- ggplot(df_or, aes(x = term, y = or)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Odds ratio (95% CI)"
+  ) +
+  theme_minimal(base_size = 14)
+
+#Patching figures together 
+(boxcdm | probcdm) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+```
+
+## Hypothesis 8
+
+Chicks are fed smaller meals on nights with brighter skies.
+
+```{r Fixed Effect Creation}
+#Days since start
+data_clean$days_from_start <-as.numeric(as.Date(data_clean$night.of) - min(as.Date(data_clean$night.of), na.rm = TRUE))
+```
+
+```{r Averaging per night}
+mean <- data_clean %>%
+  group_by(night.of) %>%
+  summarise(
+    meal_size = mean(meal_size, na.rm = TRUE),
+    mean_logcdm2 = mean(medlogcdm2, na.rm = TRUE),
+    med_logcdm2 = median(medlogcdm2, na.rm = TRUE),
+    med_illumination = median(med_illumination, na.rm = TRUE),
+    moonPhase = mean(moonPhase, na.rm = TRUE),
+    mean_moonlightModel = mean(med_moonlight, na.rm = TRUE),
+    days_from_start = first(days_from_start)
+  ) %>%
+  ungroup()
+```
+
+```{r Model Fitting}
+m2 <- lm(meal_size ~ med_logcdm2 + med_illumination + days_from_start, data = mean) 
+summary(m2)
+
+#Prediction framwork
+newdata <- data.frame(
+  med_logcdm2 = seq(min(mean$med_logcdm2), max(mean$med_logcdm2), length.out = 100),
+  med_illumination = mean(mean$med_illumination, na.rm = TRUE),
+  days_from_start = mean(mean$days_from_start, na.rm = TRUE))
+
+pred_out <- predict(m2, newdata = newdata, se.fit = TRUE)
+
+newdata$fit <- pred_out$fit
+newdata$se  <- pred_out$se.fit
+newdata$lwr <- newdata$fit - 1.96 * newdata$se
+newdata$upr <- newdata$fit + 1.96 * newdata$se
+
+#Plot 
+ggplot(mean, aes(x = med_logcdm2, y = meal_size)) +
+  geom_point() +
+  geom_ribbon(
+    data = newdata,
+    aes(x = med_logcdm2, ymin = lwr, ymax = upr),
+    inherit.aes = FALSE,
+    alpha = 0.2) +
+  geom_line(
+    data = newdata,
+    aes(x = med_logcdm2, y = fit),
+    inherit.aes = FALSE,
+    linewidth = 1, colour = "blue") +
+  scale_y_continuous(
+    name = "Mean Meal Size (g)",
+    breaks = seq(0, max(mean$meal_size, na.rm = TRUE), by = 10)) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+```

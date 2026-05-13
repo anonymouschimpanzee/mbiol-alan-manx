@@ -1,0 +1,514 @@
+---
+title: "Objective1"
+output: html_document
+date: "2026-04-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## **Introduction**
+
+This file explores Objective 1 of the project: [To evaluate the impact of ships on sky brightness]{.underline}. The file contains processing, analyses and plotting used for the final project write up.
+
+## **Housekeeping**
+
+```{r Install and Load packages}
+#General
+require(hms) #Time zone and handling times
+require(dplyr) 
+require(lubridate)
+require(tidyverse)
+require(suncalc) #Calculates sun and moon elevation, rise and set
+require(geosphere) #Calculates distance between 2 coordinates
+
+#Plots
+require(ggplot2) 
+require(ggtext) #Text labels
+require(patchwork) #Compiling plots
+
+#Models
+require(glmmTMB)
+require(broom.mixed) #Residuals and confidence intervals
+require(emmeans) #Pairwise comparisons between groups 
+require(ggeffects) #Getting predictions and plotting them
+```
+
+```{r Load Data}
+data <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Analysis/analysis/data/Ship.csv")
+head(data)
+
+#Midnight values for POSIXct are missing (due to file saving) so add back 
+data$POSIXct <- as.POSIXct(
+  ifelse(nchar(as.character(data$POSIXct)) == 10,
+         paste(data$POSIXct, "00:00:00"),
+         as.character(data$POSIXct)),
+  format="%Y-%m-%d %H:%M:%S")
+```
+
+```{r Fixed and Random Effect Creation}
+
+########## Days from Start
+#Create a Night Of ID (because data crossed midnight)
+#Coordinates of study site to get times of sunset and sunrise 
+sun <-getSunlightTimes(date = as.Date(data$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset")) 
+data <- cbind(data, sun)
+data <- subset(data, select = -c(date, lat, lon))
+
+#Set night of as the time between sunset and sunrise the next day
+data$night.of <- with(data, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+#Calculate days from start
+data$days_from_start <-as.numeric(as.Date(data$night.of) - min(as.Date(data$night.of), na.rm = TRUE))
+
+########## Hours since Midnight 
+data$hours_since_midnight <- hour(data$POSIXct) + minute(data$POSIXct)/60 + second(data$POSIXct)/3600
+
+head(data)
+
+########## Filter to remove natural illumination 
+darkdata <- filter(data, illumination == 0)
+
+```
+
+## **Hypothesis 1**
+
+**Sky brightness increases with the number of ships present in the area.**
+
+```{r Model Creation and Output}
+#Model
+shipmodel <- glmmTMB(
+  cdm2 ~ Number.of.ships + days_from_start + hours_since_midnight + (1 | days_from_start), 
+  family = Gamma(link = "log"), 
+  data = darkdata)
+
+#Model output
+summary(shipmodel)
+pred <- ggpredict(shipmodel, terms = "Number.of.ships")
+plot(pred)
+
+#Plot the model
+ship <- ggplot() +
+  geom_point(data = darkdata,
+             aes(x = Number.of.ships, y = cdm2),
+             size = 1.5) +
+  geom_line(data = pred,
+            aes(x = x, y = predicted),
+            color = "blue", linewidth = 1) +
+  geom_ribbon(data = pred,
+              aes(x = x,
+                  ymin = conf.low,
+                  ymax = conf.high),
+              alpha = 0.2) +
+  scale_x_continuous(
+    name = "Number of Ships",
+    breaks = seq(0, max(darkdata$Number.of.ships, na.rm = TRUE), by = 1)) +
+  scale_y_continuous(
+    name = expression("Sky Brightness (" * cd/m^2 * ")")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 14), 
+    axis.title.x = element_text(margin = margin(t = 14)), 
+    axis.title.y = element_text(margin = margin(r = 14)))
+```
+
+## **Hypothesis 2**
+
+**Sky brightness is inversely related to the distance between ships and the colony, with closer ships increasing sky brightness more.**
+
+```{r Calculate Distance}
+#Skomer coordinates
+skomercoord <- c(lon = -5.281967525708255, lat = 51.73763792687346)
+
+#Get coordinates of ships into separate vector
+shipcoord <- cbind(darkdata$lon, darkdata$lat)
+
+#Replicate skomer coordinates for the number of ships we have positions for 
+skomercoord <- matrix(rep(skomercoord, nrow(darkdata)), ncol = 2, byrow = TRUE) 
+
+#Calculate distance in meters
+darkdata$distance.metres <- distVincentyEllipsoid(shipcoord, skomercoord)
+
+#Average distance of all the ships per time point
+darkdata2 <- darkdata  %>%
+  group_by(POSIXct) %>%
+  summarise(
+    distance.metres = median(distance.metres, na.rm = TRUE), 
+    across(c(cdm2, days_from_start, hours_since_midnight), first),
+    .groups = "drop")
+```
+
+```{r Model Creation and Output}
+#Model
+dismodel <- glmmTMB(
+  cdm2 ~ distance.metres + days_from_start + hours_since_midnight + (1 | days_from_start),
+  family = Gamma(link = "log"),
+  data = darkdata2)
+
+#Model output
+summary(dismodel)
+pred2 <- ggpredict(dismodel, terms = "distance.metres")
+plot(pred2)
+
+#Plot the model
+distance <- ggplot() +
+  geom_point(data = darkdata2,
+             aes(x = distance.metres, y = cdm2),
+             size = 1.5) +
+  geom_line(data = pred2,
+            aes(x = x, y = predicted),
+            color = "blue", linewidth = 1) +
+  geom_ribbon(data = pred2,
+              aes(x = x,
+                  ymin = conf.low,
+                  ymax = conf.high),
+              alpha = 0.2) +
+  scale_x_continuous(
+    name = "Distance from study colony (m)",
+    breaks = seq(0, max(darkdata2$distance.metres, na.rm = TRUE), by = 2500)) +
+  scale_y_continuous(
+    name = expression("Sky Brightness (" * cd/m^2 * ")")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 12), 
+    axis.title.x = element_text(margin = margin(t = 14)), 
+    axis.title.y = element_text(margin = margin(r = 14)))
+
+
+```
+
+## **Hypothesis 3**
+
+**Sky brightness increases when ship lighting is oriented toward the colony compared to when it is oriented away.**
+
+#### (1) Heading
+
+```{r Calculate heading with respect to Skomer}
+#Skomer coordinates (need to be separated this time)
+skomerlon <-  -5.281967525708255    
+skomerlat <- - 51.73763792687346 
+
+########### Calculate bearing from each ship to skomer colony
+#Geosphere package expects (lon,lat) pairs; returns degrees (may be negative)
+bearing_to_sk <- bearing(
+  p1 = as.matrix(darkdata[, c("lon","lat")]), 
+  p2 = matrix(c(skomerlon, skomerlat), nrow = nrow(darkdata), ncol = 2, byrow = TRUE))
+
+#Normalize bearings to 0 and 360
+bearing_to_sk <- (bearing_to_sk + 360) %% 360
+
+#Add bearing to dataframe
+darkdata$bearing_to_sk <- bearing_to_sk
+
+########## Compute relative heading
+#We want: 0 = ship is heading directly toward Skomer
+#Relative = bearing_to_sk - ship_heading
+#Then convert to signed -180/+180
+#Negative = need to turn left to face Skomer, positive = need to turn right to face Skomer 
+rel_deg_0_360 <- (darkdata$bearing_to_sk - darkdata$heading + 360) %% 360
+rel_deg_signed <- ifelse(rel_deg_0_360 > 180, rel_deg_0_360 - 360, rel_deg_0_360)
+
+#Add to dataframe
+darkdata$relative_heading_deg <- rel_deg_signed
+
+#Interprete the heading number so its easier to understand
+interpret <- function(x){
+  if(is.na(x)) return(NA)
+  if(x == 0) return("_Heading directly toward Skomer")
+  if(abs(x) == 180) return("_Heading directly away from Skomer")
+  if(x > 0) return(paste0(round(x,1),"_clockwise (turn right) to point at Skomer"))
+  if(x < 0) return(paste0(round(abs(x),1),"_anticlockwise (turn left) to point at Skomer"))
+}
+darkdata$interpretation <- sapply(darkdata$relative_heading_deg, interpret)
+
+#Split up interpretation from the heading number so we can plot heading 
+darkdata <- separate(
+  darkdata,
+  interpretation,
+  into = c("heading_sk", "interpretation"),
+  sep = "_",
+  remove = FALSE)
+
+#Make sure it is numeric 
+darkdata$heading_sk <- as.numeric(darkdata$heading_sk)
+
+#Average heading of all the ships per time point
+darkdata2 <- darkdata  %>%
+  group_by(POSIXct) %>%
+  summarise(
+    heading_sk = median(heading_sk, na.rm = TRUE), 
+    across(c(cdm2, days_from_start, hours_since_midnight), first),
+    .groups = "drop")
+```
+
+```{r Model Creation and Output}
+#Model
+headmodel <- glmmTMB(
+  cdm2 ~ heading_sk + days_from_start + hours_since_midnight + (1 | days_from_start),
+  family = Gamma(link = "log"), 
+  data = darkdata2)
+
+#Model output
+summary(headmodel)
+pred3 <- ggpredict(headmodel, terms = "heading_sk")
+plot(pred3)
+
+#Plot the model
+head <- ggplot() +
+  geom_point(data = darkdata2,
+             aes(x = heading_sk, y = cdm2),
+             size = 1.5) +
+  geom_line(data = pred3,
+            aes(x = x, y = predicted),
+            color = "blue", linewidth = 1) +
+  geom_ribbon(data = pred3,
+              aes(x = x,
+                  ymin = conf.low,
+                  ymax = conf.high),
+              alpha = 0.2) +
+  scale_x_continuous(
+    name = "Heading (°)",
+    breaks = seq(0, 180, by = 30)) +
+  scale_y_continuous(
+    name = expression("Sky Brightness (" * cd/m^2 * ")")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 12), 
+    axis.title.x = element_text(margin = margin(t = 14)), 
+    axis.title.y = element_text(margin = margin(r = 14)))
+```
+
+#### (2) Orientation
+
+```{r Model Creation and Output}
+#Define heading as an orientation 
+darkdata2$heading_bin <- cut(
+  darkdata2$heading_sk,
+  breaks = c(0, 45, 135, 180),
+  labels = c("Front", "Side", "Rear"))
+darkdata2$heading_bin <- factor(darkdata2$heading_bin)
+
+#Model 
+headgroup <- glmmTMB(
+  cdm2 ~ heading_bin + hours_since_midnight + (1 | days_from_start),
+  family = Gamma(link = "log"),
+  data = darkdata2)
+
+#Model Output
+summary(headgroup)
+
+#Pairwise comparisons
+emm <- emmeans(headgroup, ~ heading_bin)
+pw <- as.data.frame(pairs(emm, adjust = "tukey"))
+
+#Plot the model
+#Split "A - B" into two columns for plotting brackets
+pw <- pw %>%
+  separate(contrast, into = c("group1", "group2"), sep = " - ") %>%
+  mutate(
+    p.signif = case_when(
+      p.value <= 0.001 ~ "***",
+      p.value <= 0.01  ~ "**",
+      p.value <= 0.05  ~ "*",
+      TRUE ~ "ns"))
+
+#Set bracket heights
+ymax <- max(darkdata2$cdm2, na.rm = TRUE)
+yrng <- diff(range(darkdata2$cdm2, na.rm = TRUE))
+pw$y.position <- ymax + seq(0.08, by = 0.08, length.out = nrow(pw)) * yrng
+
+headgroup <- ggplot(darkdata2, aes(x = heading_bin, y = cdm2, fill = heading_bin)) + 
+  geom_boxplot(width = 0.65, alpha = 0.8, outlier.shape = NA) +
+  geom_jitter(width = 0.12, size = 1.0) +
+  scale_fill_brewer(palette = "Set2") +
+  stat_pvalue_manual(
+    pw,
+    label = "p.signif",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    size = 7
+  ) +
+  scale_y_continuous(
+    name = expression("Sky Brightness (" * cd/m^2 * ")")
+  ) +
+  scale_x_discrete(
+    name = "Heading Orientation"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 14),
+    axis.title.x = element_text(margin = margin(t = 14)),
+    axis.title.y = element_text(margin = margin(r = 14)),
+    legend.position = "none")
+```
+
+```{r Final Plot}
+#Plot all 4 together with lettering 
+(ship | distance) /
+  (head | headgroup) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+```
+
+## **Is Artificial Light at Night able to replicate a Full Moon?** 
+
+```{r Housekeeping}
+####### Read in the light data
+lightdata <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Analysis/analysis/data/Light.csv")
+
+####### Split data into moon cyles
+#Get moon illumination info
+moon <- getMoonIllumination(date = lightdata$POSIXct)
+
+#Create phase names by the phase percentage
+phase_name <- function(p) {
+  if (p < 0.0625 || p >= 0.9375) return("New Moon")
+  if (p < 0.1875) return("Waxing Crescent")
+  if (p < 0.3125) return("First Quarter")
+  if (p < 0.4375) return("Waxing Gibbous")
+  if (p < 0.5625) return("Full Moon")
+  if (p < 0.6875) return("Waning Gibbous")
+  if (p < 0.8125) return("Last Quarter")
+  return("Waning Crescent")}
+
+lightdata$moonPhaseName <- vapply(moon$phase, phase_name, character(1))
+
+######## Night of ID (same as above)
+sun <-getSunlightTimes(date = as.Date(lightdata$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset"))
+lightdata <- cbind(lightdata, sun)
+lightdata <- subset(lightdata, select = -c(date, lat, lon))
+#Give night.id again (same as before)
+lightdata$night.of <- with(lightdata, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+####### Filtering
+#Remove data when sun is having an effect (inflates and we only want to look at lunar effects)
+lightdata <- filter(lightdata, twilightModel < 0.00001)
+
+#Filter for dark (ALAN only)
+lightdata$illumination <- as.numeric(lightdata$illumination)
+dark <- filter(lightdata, illumination == 0)
+
+#Remove data points when moon is below horizon (only want to look at when moon is actually up - dont want to compare ALAN with a night when moon can reach 50% but has set already)
+lunar <- filter(lightdata, illumination > 0)
+
+####### Merging datasets 
+#Assign ALAN a category name so I can merge with lunar phase data
+dark <- dark %>%
+  mutate(moonPhaseName = "ALAN")
+combined <- bind_rows(lunar, dark)
+
+####### Get a mean (mean, median, maximum) for each lunar phase and for ALAN
+combmean <- combined %>%
+  group_by(moonPhaseName) %>%
+  summarise(
+    mean_cdm2 = mean(cdm2, na.rm = TRUE),
+    mean_logcdm2 = mean(logcdm2, na.rm = TRUE),
+    max_cdm2 = max(cdm2, na.rm = TRUE), 
+    max_logcdm2 = max(logcdm2, na.rm = TRUE),
+    med_cdm2 = median(cdm2, na.rm = TRUE),
+    med_logcdm2 = median(logcdm2, na.rm = TRUE),
+    .groups = "drop")
+
+#Look at cd/m2 for ALAN and all the moon phases  
+max(dark$logcdm2)
+max(lunar$logcdm2)
+mean(dark$logcdm2)
+mean(lunar$logcdm2)
+
+####### Housekeeping for plotting
+#Order labels so they plot in moon cycle order
+combined$moonPhaseName <- factor(
+  combined$moonPhaseName,
+  levels = rev(c(
+    "New Moon", "Waxing Crescent", "First Quarter",
+    "Waxing Gibbous", "Full Moon",
+    "Waning Gibbous", "Last Quarter",
+    "Waning Crescent",
+    "ALAN")))
+
+#Colours based on how bright it is 
+phase_cols <- c(
+  "New Moon" = "#1750AC",
+  "Waxing Crescent" = "#3373C4",
+  "First Quarter" = "#73B9EE",
+  "Waxing Gibbous" = "#E8C766",
+  "Full Moon" = "#E8AF30",
+  "Waning Gibbous" = "#E8C766",
+  "Last Quarter" = "#73B9EE",
+  "Waning Crescent" = "#3373C4", 
+  "ALAN" = "#eb7d31")
+```
+
+```{r Model}
+#Model to show difference in cd/m2 between ALAN and different moon phases
+moongroup <- glmmTMB(logcdm2 ~ moonPhaseName, family = gaussian(), data = combined)
+
+#Model output 
+summary(moongroup)
+
+#Pairwise comparisons from the fitted model
+library(emmeans)
+emm <- emmeans(moongroup, ~ moonPhaseName)
+pw <- as.data.frame(pairs(emm, adjust = "tukey"))
+```
+
+```{r Plots}
+#Boxplot
+box <- ggplot(combined, aes(x = logcdm2, y = moonPhaseName, fill = moonPhaseName)) +
+  geom_point(aes(color = moonPhaseName),
+             position = position_jitter(width = 0.01),
+             alpha = 0.8) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  scale_fill_manual(values = phase_cols) +
+  scale_color_manual(values = phase_cols) +
+  scale_y_discrete(name = "Moon Phase", expand = expansion(add = 0.6)) +
+  scale_x_continuous(name = expression("Sky Brightness (" * log (cd/m^2) * ")")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_markdown(size = 12, angle = 0, vjust = 0.8),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 15,margin = margin (r=15)),
+    axis.title.x = element_text(size = 15, margin = margin (t=15)),
+    plot.margin = margin(l = 10, b = 10, r = 10, t = 10))
+#This will be an underestimation of ALAN bc the nat contains ALAN as well. But is the best we can do considering 
+
+#Plot bar graph 
+bar <- ggplot(combmean, aes(x = moonPhaseName, y = max_logcdm2, fill = moonPhaseName)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = phase_cols) +
+  geom_hline(yintercept = 1.849424, linetype = "dashed", color = "#eb7d31")+
+  scale_x_discrete(name = "Moon Phase", breaks = combmean$moonPhaseName, expand = expansion(add = 0.2)) +
+  scale_y_continuous(name = expression("Maximum Sky Brightness (" * log (cd/m^2) * ")")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_markdown(size = 12),
+    axis.title.x = element_text(size = 15,  margin = margin (t=15)),
+    axis.title.y = element_text(size = 15, margin = margin (r=15)),
+    plot.margin = margin(l = 10, b = 10, r = 10, t = 10))
+
+#Plot all 2 together with lettering 
+(box) /
+  (bar) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+```

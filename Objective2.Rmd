@@ -1,0 +1,1056 @@
+---
+title: "Objective2"
+output: html_document
+date: "2026-04-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This file explores Objective 2 of the project: [To determine whether light and ships impact activity levels at the breeding colony]{.underline}. The file contains processing, analyses and plotting used for the final project write up.
+
+## **Housekeeping**
+
+```{r Install and Load packages}
+
+#General
+require(hms) #Time zone and handling times
+require(dplyr) 
+require(lubridate)
+require(tidyverse)
+require(purrr)
+require(suncalc) #Calculates sun and moon elevation, rise and set
+require(stringr)
+
+#Plots
+require(ggplot2) 
+require(patchwork) #Compiling plots
+
+#Models
+require(MASS) #Predictions of linear models (glm.nb)
+require(lme4) #Fit linear and generalised linear mixed models (glmer.nb)
+require(ggfortify) #Plotting of statistics/inspecting residuals
+require(car)
+
+#Sound file processing 
+require(tuneR)
+require(seewave)
+```
+
+## Hypothesis 4
+
+The number of shearwaters on the surface of the colony is significantly lower when sky brightness is higher
+
+```{r Load Data}
+#Hypothesis 4 (surface activity) data
+scopecount <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Analysis/analysis/data/CountsSurface.csv")
+head(scopecount)
+
+#Midnight values for POSIXct are missing (due to file saving) so add back 
+scopecount$POSIXct <- as.POSIXct(
+  ifelse(nchar(as.character(scopecount$POSIXct)) == 10,
+         paste(scopecount$POSIXct, "00:00:00"),
+         as.character(scopecount$POSIXct)),
+  format="%Y-%m-%d %H:%M:%S")
+```
+
+```{r Fixed and Random Effect Creation}
+########## Days from Start
+#Create a Night Of ID (because data crossed midnight)
+#Coordinates of study site to get times of sunset and sunrise 
+sun <-getSunlightTimes(date = as.Date(scopecount$POSIXct), tz = "UTC", lat= 51.737449, lon=-5.287829, keep =c("sunrise",  "sunset")) 
+scopecount <- cbind(scopecount, sun)
+scopecount <- subset(scopecount, select = -c(date, lat, lon))
+
+#Set night of as the time between sunset and sunrise the next day
+scopecount$night.of <- with(scopecount, as.Date(
+  ifelse(POSIXct >= sunset, as.Date(sunset),           
+         ifelse(POSIXct < sunrise, as.Date(sunrise) - 1, as.Date(POSIXct)))))
+
+#Calculate days from start
+scopecount$days_from_start <-as.numeric(as.Date(scopecount$night.of) - min(as.Date(scopecount$night.of), na.rm = TRUE))
+
+########## Hours since Midnight
+#Include time of day 
+scopecount$hours_since_midnight <- hour(scopecount$POSIXct) + minute(scopecount$POSIXct)/60 + second(scopecount$POSIXct)/3600
+
+head(scopecount)
+```
+
+```{r Model Testing}
+#Count data - a Poisson distribution with log link function (makes sure predictions are not negative)
+
+#First model using poisson distribution and log link 
+glm1 <- glm(Number.on.surface ~ logcdm2 + days_from_start + hours_since_midnight, family = poisson(link = "log"), data = scopecount)
+autoplot(glm1, which = c(1,3))
+summary(glm1)
+#Did not use this model:
+  #Variance is not equal to the mean (ratio of residual deviance to residual degrees of         freedom) 
+  #The ratio of residual deviance to df is 1161.8:246 which is really bad (1161.8:246 is much   larger than 1) 
+
+#This large ratio indicates overdispersion
+#Is the data zero-inflated? (common cause of overdispersion)
+table(scopecount$Number.on.surface) #Yes it is so need to fit a (1) quasi poisson or (2) negative binomial
+
+#Solution 1: Quasi poisson model 
+glm2 <- glm(Number.on.surface ~ logcdm2 + days_from_start + hours_since_midnight, 
+            family = quasipoisson(link = "log"), 
+            data = scopecount)
+autoplot(glm2, which = c(1,3))
+summary(glm2)
+#Still really high ratio - not good model 
+
+#Solution 2 is a negative binomial 
+glm3 <- glm.nb(Number.on.surface ~ logcdm2 + days_from_start + hours_since_midnight, 
+               data = scopecount)
+autoplot(glm3, which = c(2))
+summary(glm3)
+#Better!
+
+#Add a random effect of night.of bc need to account for replication within nights  
+#This is a generalized mixed effects model (GLMM) with negative binomial distribution and log link
+glm4 <- glmer.nb(Number.on.surface ~ logcdm2 + illumination + days_from_start + hours_since_midnight + (1 | night.of),
+         data = scopecount)
+summary(glm4)
+#This made the residual deviance 294.55:246 which is much better 
+
+#AIC also shows glm4 is better than glm1 (glm1 = 2002, glm4 = 1422)
+AIC(glm1, glm2, glm3, glm4)
+```
+
+```{r Model and Plot - Including Natural Illumination}
+#Final model used: 
+allglm <- glmer.nb(Number.on.surface ~ no.ships + logillumination.x + logcdm2.x + days_from_start + hours_since_midnight + (1 | night.of), data = scopecount)
+summary(allglm)
+
+#Prediction dataframe for cd/m2
+cdm_all <- data.frame(
+  logcdm2.x = seq(min(scopecount$logcdm2.x, na.rm = TRUE),
+                  max(scopecount$logcdm2.x, na.rm = TRUE),
+                  length.out = 100),
+  no.ships = mean(scopecount$no.ships, na.rm = TRUE),
+  logillumination.x = mean(scopecount$logillumination.x, na.rm = TRUE),
+  days_from_start = mean(scopecount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(scopecount$hours_since_midnight, na.rm = TRUE))
+
+#Prediction dataframe for natural illumination
+nat_all <- data.frame(
+  logillumination.x = seq(min(scopecount$logillumination.x, na.rm = TRUE),
+                  max(scopecount$logillumination.x, na.rm = TRUE),
+                  length.out = 100),
+  no.ships = mean(scopecount$no.ships, na.rm = TRUE),
+  logcdm2.x = mean(scopecount$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(scopecount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(scopecount$hours_since_midnight, na.rm = TRUE))
+
+#Prediction data for ships
+ship_all <- data.frame(
+  no.ships = seq(min(scopecount$no.ships, na.rm = TRUE),
+                          max(scopecount$no.ships, na.rm = TRUE),
+                          length.out = 100),
+  logillumination.x = mean(scopecount$logillumination.x, na.rm = TRUE),
+  logcdm2.x = mean(scopecount$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(scopecount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(scopecount$hours_since_midnight, na.rm = TRUE))
+
+#Predict for cd/m2
+cdm_all$fit_link <- predict(allglm, cdm_all, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logillumination.x + logcdm2.x + days_from_start + hours_since_midnight, cdm_all)
+V <- vcov(allglm)
+cdm_all$se_link <- sqrt(diag(X %*% V %*% t(X)))
+cdm_all$lwr <- exp(cdm_all$fit_link - 1.96 * cdm_all$se_link)
+cdm_all$upr <- exp(cdm_all$fit_link + 1.96 * cdm_all$se_link)
+cdm_all$pred <- exp(cdm_all$fit_link)
+
+#Predict for natural illumination
+nat_all$fit_link <- predict(allglm, nat_all, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logillumination.x + logcdm2.x + days_from_start + hours_since_midnight, nat_all)
+V <- vcov(allglm)
+nat_all$se_link <- sqrt(diag(X %*% V %*% t(X)))
+nat_all$lwr <- exp(nat_all$fit_link - 1.96 * nat_all$se_link)
+nat_all$upr <- exp(nat_all$fit_link + 1.96 * nat_all$se_link)
+nat_all$pred <- exp(nat_all$fit_link)
+
+#Predict for ships
+ship_all$fit_link <- predict(allglm, ship_all, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logillumination.x + logcdm2.x + days_from_start + hours_since_midnight, ship_all)
+V <- vcov(allglm)
+ship_all$se_link <- sqrt(diag(X %*% V %*% t(X)))
+ship_all$lwr <- exp(ship_all$fit_link - 1.96 * ship_all$se_link)
+ship_all$upr <- exp(ship_all$fit_link + 1.96 * ship_all$se_link)
+ship_all$pred <- exp(ship_all$fit_link)
+
+#Plot ships
+shipplot1 <- ggplot(scopecount, aes(x = no.ships, y = Number.on.surface)) +
+  geom_point() +
+  geom_line(data = ship_all, aes(x = no.ships, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = ship_all,
+              aes(x = no.ships, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters on Surface",
+    breaks = seq(0, max(scopecount$Number.on.surface, na.rm = TRUE), by = 10)) +
+  coord_cartesian(ylim = c(0, 40)) +
+  scale_x_continuous(
+    name = expression("Number of Ships")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+shipplot1
+
+#Plot cd/m2
+cdmplot1 <- ggplot(scopecount, aes(x = logcdm2.x, y = Number.on.surface)) +
+  geom_point() +
+  geom_line(data = cdm_all, aes(x = logcdm2.x, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = cdm_all,
+              aes(x = logcdm2.x, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters on Surface",
+    breaks = seq(0, max(scopecount$Number.on.surface, na.rm = TRUE), by = 10)) +
+  coord_cartesian(ylim = c(0, 40)) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+cdmplot1
+
+#Plot natural illumination
+natplot <- ggplot(scopecount, aes(x = logillumination.x, y = Number.on.surface)) +
+  geom_point() +
+  geom_line(data = nat_all, aes(x = logillumination.x, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = nat_all,
+              aes(x = logillumination.x, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters on Surface",
+    breaks = seq(0, max(scopecount$Number.on.surface, na.rm = TRUE), by = 10)) +
+  coord_cartesian(ylim = c(0, 40)) +
+  scale_x_continuous(
+    name = expression("Natural Illumination (log(lux))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+natplot
+
+```
+
+```{r Model and Plot - Excluding Natural Illumination}
+#Filter to remove when natural illuminance is above 0
+filtered <- scopecount %>%
+  filter(illumination.x <= 0)
+
+#Model used without natural illumination as a factor 
+filteredglm <- glmer.nb(Number.on.surface ~ no.ships + logcdm2.x + days_from_start + hours_since_midnight + (1 | night.of), data = filtered)
+summary(filteredglm)
+Anova(filteredglm, type = "II")
+
+#Create prediction data for cd/m2
+cdm_new <- data.frame(
+  logcdm2.x = seq(min(filtered$logcdm2.x, na.rm = TRUE),
+                  max(filtered$logcdm2.x, na.rm = TRUE),
+                  length.out = 100),
+  no.ships = mean(filtered$no.ships, na.rm = TRUE),
+  days_from_start = mean(filtered$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(filtered$hours_since_midnight, na.rm = TRUE))
+
+#Create prediction data for ships
+ship_new <- data.frame(
+  no.ships = seq(min(filtered$no.ships, na.rm = TRUE),
+                 max(filtered$no.ships, na.rm = TRUE),
+                 length.out = 100),
+  logcdm2.x = mean(filtered$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(filtered$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(filtered$hours_since_midnight, na.rm = TRUE))
+
+#Predict for cd/m2
+cdm_new$fit_link <- predict(filteredglm, cdm_new, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logcdm2.x + days_from_start + hours_since_midnight, cdm_new)
+V <- vcov(filteredglm)
+cdm_new$se_link <- sqrt(diag(X %*% V %*% t(X)))
+cdm_new$lwr <- exp(cdm_new$fit_link - 1.96 * cdm_new$se_link)
+cdm_new$upr <- exp(cdm_new$fit_link + 1.96 * cdm_new$se_link)
+cdm_new$pred <- exp(cdm_new$fit_link)
+
+#Predict for ships
+ship_new$fit_link <- predict(filteredglm, ship_new, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logcdm2.x + days_from_start + hours_since_midnight, ship_new)
+V <- vcov(filteredglm)
+ship_new$se_link <- sqrt(diag(X %*% V %*% t(X)))
+ship_new$lwr <- exp(ship_new$fit_link - 1.96 * ship_new$se_link)
+ship_new$upr <- exp(ship_new$fit_link + 1.96 * ship_new$se_link)
+ship_new$pred <- exp(ship_new$fit_link)
+
+#Cd/m2 plot
+cdmplot2 <- ggplot(filtered, aes(x = logcdm2.x, y = Number.on.surface)) +
+  geom_point() +
+  geom_line(data = cdm_new, aes(x = logcdm2.x, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = cdm_new,
+              aes(x = logcdm2.x, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters on Surface",
+    breaks = seq(0, max(filtered$Number.on.surface, na.rm = TRUE), by = 10))+
+  coord_cartesian(ylim = c(0, 30)) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+cdmplot2
+
+#Ship plot
+shipplot2 <- ggplot(filtered, aes(x = no.ships, y = Number.on.surface)) +
+  geom_point() +
+  geom_line(data = ship_new, aes(x = no.ships, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = ship_new,
+              aes(x = no.ships, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwaters on Surface",
+    breaks = seq(0, max(filtered$Number.on.surface, na.rm = TRUE), by = 10))+
+  coord_cartesian(ylim = c(0, 30)) +
+  scale_x_continuous(
+    name = expression("Number of Ships")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+shipplot2
+```
+
+```{r Patch together the figures}
+(shipplot1 | cdmplot1) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+
+(shipplot2 | cdmplot2) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")")
+```
+
+## Hypothesis 5
+
+Vocal activity is significantly lower when sky brightness is higher.
+
+#### Step 1: High Pass Filtering
+
+Removing any background noise from the sound files (mainly wind noise).
+
+```{r High Pass Filtering}
+#High pass filtering for bird frequencies (2-8kHz)
+
+#Set working directory
+setwd("/Users/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files")
+
+#Base directories (raw_files contains my original sound files and filtered-files is where I want the new files to go that are filtered)
+input_base <- "raw-files"
+output_base <- "filtered-files"
+
+#Find all .wav files within all subfolders. Case is important to distinguish because some files are .wav and some are .WAV
+raw_wav_files <- list.files("raw-files", pattern = "\\.wav$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+
+#Check that the files are all being called with length(raw_wav_files). It calls around 3000 files so that sounds about right for the data set I have 
+for (wav_path in raw_wav_files) {
+
+#Extract relative path (e.g., "2025-07-01/Peak activity/file.wav") but removing the last path separator = .wav files (this is because we only want the folders not the files to be replicated in the output base)
+  rel_path <- dirname(sub(paste0("^", input_base, "/"), "", wav_path))
+  
+  #Make a matching output folder structure (dir.create makes a file path)
+  output_folder <- file.path(output_base, rel_path)
+  dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+  
+  #Read the file
+  file <- readWave(wav_path)
+  
+  #Apply bandpass filter
+  filtered <- bwfilter(file, f = file@samp.rate, from = 230)
+  
+  #Convert to Wave object
+  filtered_wave <- Wave(left = filtered, samp.rate = file@samp.rate, bit = file@bit)
+  
+  #Build output filename - basename removes all the whole whole path except the file name (.wav) and then we add filtered onto the front to distinguish it from the raw files
+  file_name <- tools::file_path_sans_ext(basename(wav_path))
+  output_file <- file.path(output_folder, paste0(file_name, "-filtered.wav"))
+  
+  #Save filtered file
+  savewav(filtered_wave, filename = output_file)
+  #Print what files are saved so I can keep track of progress as it downloads - e.g. needed to troubleshoot as stopped in the middle of the file
+  cat("Saved filtered file to:", output_file, "\n")}
+```
+
+#### Step 2: Which BirdNET model is best?
+
+```{r Comparing Models from BirdNET Analyser}
+#Load all the csv files of the models (first 1 are slightltly different so require a diff approach)
+modelpaths <- c(
+  "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/pattern-detection/model-output-1/CustomClassifier_evaluation.csv",
+  "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/pattern-detection/model-output-2/Model2_evaluation.csv",
+  paste0("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/pattern-detection/model-output-", 3:10, "/CustomClassifier_evaluation.csv")
+) |> unlist()
+
+#Add an identifier for each model (e.g The first model = Model 1) 
+#Merge them into one dataframe
+all_models <- map2_dfr(modelpaths, seq_along(modelpaths), ~ {
+  read.csv(.x) |> mutate(Model = paste0("Model", .y))})
+
+#Extract model with highest f.score for identification of Manx shearwater
+best_manx_model <- all_models %>%
+  #Only showing scores for detecting Manx
+  filter(Class == "Puffinus puffinus_Manx Shearwater") %>% 
+  #Removig columns that arent relevant to analysis
+  select(-Precision..0.5.,
+         -Recall..0.5.,
+         -F1.Score..0.5.,
+         -Class) %>% 
+  #Renaming columns
+  rename(Precision = Precision..opt., 
+         Recall = Recall..opt., 
+         F1.Score = F1.Score..opt., 
+         'Optimal Threshold' = Optimal.Threshold, 
+         'True Positives' = True.Positives, 
+         'True Negatives' = True.Negatives, 
+         'False Positives' = False.Positives,
+         'False Negatives' = False.Negatives,
+         Percentage = Percentage....) %>% 
+  #Reording columns
+  select(Model, Precision, everything()) %>% 
+  #Order by F1 Score
+  arrange(desc(F1.Score))
+
+###MODEL 10 IS THE BEST - highest f score and very high AUROC
+#Save this  
+write.csv(best_manx_model, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/pattern-detection/BestModels.csv", row.names = FALSE)
+```
+
+#### Step 3: Extract Number of Calls from BirdNET
+
+```{r Extract Number of Calls from Best Model}
+#BirdNET provides an output csv which lists the detections in each file 
+#Need to extract the number of calls per file, to get the number of calls per time point 
+
+path <- "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/BirdNET_output"
+
+#Get all CSV file names
+files <- list.files(path, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
+
+#Read them all into a list of data frames
+df_list <- setNames(lapply(files, read.csv),
+                    basename(tools::file_path_sans_ext(files)))
+
+#To determine number of calls, we need to count the number of rows in each dataframe and make that into a new data-frame
+detections <- data.frame(
+  file = names(df_list),
+  detection.no = sapply(df_list, nrow))
+
+#Extracting date and time from the file names 
+detections <- detections %>%
+  mutate(UTC.Date = str_sub(file, 1, 8),
+    UTC.Time = str_sub(file, 10, 15)) %>%
+  mutate(UTC.Date = as.Date(UTC.Date, format = "%Y%m%d"),
+  UTC.Time = format(strptime(UTC.Time, format = "%H%M%S"), "%H:%M:%S"))
+
+#Merge with light data
+light <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/LightMeter.csv")
+
+#Getting date and time in the same format as sound data
+light$UTC.Date <- format(as.Date(light$UTC.Date, format = "%d/%m/%Y"), "%Y-%m-%d")
+light$UTC.Time <- format(strptime(light$UTC.Time, format = "%I:%M %p"), "%H:%M:%S")
+
+#Merging 
+detections.light <- merge(detections, light, by=c("UTC.Date","UTC.Time"), all = TRUE)
+
+#Removing rows with NAs 
+detections.clean <- na.omit(detections.light)
+
+#Keep first of duplicates (duplicates bc have 2 audiomoths deployed - sometimes the 2 audiomoths overlapping in records - they were consistent with one another ) 
+detections.clean <- detections.clean %>%
+  distinct(UTC.Date, UTC.Time, file, .keep_all = TRUE)
+
+#Save this in directory for safe keeping
+write.csv(detections.clean, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/Detections.csv", row.names = FALSE)
+```
+
+#### Step 4: How well does BirdNET detect the number of calls?
+
+```{r Number of Detections - Comparison of Manual vs Automated BirdNET detections}
+############## Get a random stratified sample of BirdNET files for manual counts 
+#Ensure required column exists:
+detections.clean$file
+#Find out what minimum and maximum number of detections are before determining bins for stratifications
+min(detections.clean$detection.no) #0
+max(detections.clean$detection.no) #118
+
+#Creating bins based on the number of detections
+detections.bins <- detections.clean %>%
+  mutate(detection.bin = cut(detection.no,
+                        breaks = c(0, 20, 40, 60, 80, 100, 120),
+                        include.lowest = TRUE,
+                        labels = c("0-20", "20-40", "40-60", "60-80", "80-100", "100-120")))
+
+#Proportional sampling depending on number in each bin
+#Saying I need a total of 50 samples and each bin must have at least 1 sample in it
+#Max shouldnt have more than is available in the bin 
+samples_per_bin <- detections.bins %>%
+  group_by(detection.bin) %>%
+  summarise(stratum_n = n(), .groups = "drop") %>%
+  mutate(
+    samples_needed = pmax(1, round(stratum_n / total_n * 50)),  # min 1
+    samples_needed = pmin(samples_needed, stratum_n))
+
+#Drawing the sample 
+sampled <- detections.bins %>%
+  left_join(samples_per_bin, by = "detection.bin") %>%
+  group_by(detection.bin) %>%
+  sample_n(size = first(8.3), replace = FALSE) %>%
+  ungroup()
+
+#Save the samples bc when you run the code again, the samples will change every time
+write.csv(sampled, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/BirdNET_output/sampled_files.csv", row.names = FALSE)
+
+#################### Calculating difference between manual and automatic counts
+#Done manual counts without code 
+
+#Insert the new dataframe now that I have manually counted the number of calls 
+sampled <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/tests/manualvsautomated/sampled_files.csv")
+
+#Ensure numeric columns
+#detection.no =  BirdNET
+#manual.detection.no = manual 
+sampled$detection.no <- as.numeric(sampled$detection.no)
+sampled$manual.detection.no <- as.numeric(sampled$manual.detection.no)
+
+#Differences
+sampled <- sampled %>%
+  mutate(
+    diff = detection.no - manual.detection.no,
+    absdiff = abs(detection.no - manual.detection.no),
+    sqdiff = diff^2
+  )
+
+#Mean Absolute Error
+MAE <- mean(sampled$absdiff)
+
+#Mean Error (bias)
+bias <- mean(sampled$diff)
+
+#Root Mean Square Error
+RMSE <- sqrt(mean(sampled$sqdiff))
+
+#Pearson correlation (linear relationship)
+pearson_r <- cor(sampled$detection.no, sampled$manual.detection.no, method = "pearson")
+
+#Spearman correlation (rank-based, robust to outliers)
+spearman_r <- cor(sampled$detection.no, sampled$manual.detection.no, method = "spearman")
+
+#Normality test for differences
+shap <- shapiro.test(sampled$diff)
+
+#Choose paired test (t-test if normal, Wilcoxon if not)
+if (shap$p.value > 0.05) {
+  paired_test <- t.test(sampled$detection.no, sampled$manual.detection.no, paired = TRUE)
+  test_used <- "Paired t-test"
+} else {
+  paired_test <- wilcox.test(sampled$detection.no, sampled$manual.detection.no, paired = TRUE)
+  test_used <- "Wilcoxon signed-rank test"
+}
+
+#Summary of all these metrics
+results <- list(
+  n = nrow(sampled),
+  MAE = MAE,
+  Bias = bias,
+  RMSE = RMSE,
+  Pearson_r = pearson_r,
+  Spearman_r = spearman_r,
+  Normality_p_value = shap$p.value,
+  Test_used = test_used,
+  Test_p_value = paired_test$p.value)
+
+results
+
+#All of this means there is a strong positive relationship between BirdNET counts and my manual counts
+#It overcounts slightly but that is fine - bc it is relative 
+#$n = 48
+#MAE = 21.04167
+#Bias = 12.54167 - Means the BirdNET systematically overcounts (positives)
+#RMSE = 26.97375 
+#Pearson_r = 0.7519756
+#Spearman_r = 0.7363127 #Strong positive correlation between the manual and automatic counts
+
+#Plot to show they are highly correlated
+ggplot(sampled, aes(x = manual.detection.no, y = detection.no)) +
+  geom_point(size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "solid", color = "red") +
+  scale_x_continuous(
+    name = "Manual Count",
+    breaks = seq(0, max(sampled$manual.detection.no, na.rm = TRUE), by = 20)
+  ) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  scale_y_continuous(
+    name = "BirdNET Model Count",
+    breaks = pretty(sampled$detection.no)
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12))
+
+#Which files are the outliers and why? 
+#Biggest deviations from where manual = BirdNET detection (distance between manual and BirdNET detection)
+sampled <- sampled %>%
+  mutate(
+    diff_identity = detection.no - manual.detection.no,
+    abs_identity_dist = abs(diff_identity)
+  )
+
+#Worst differences (top 5)
+top_outliers <- sampled %>%
+  arrange(desc(abs_identity_dist)) %>%
+  slice_head(n = 10)
+top_outliers %>%
+  select(file, manual.detection.no, detection.no, diff_identity)
+
+#Highlighting these on the plot
+plot(sampled$manual.detection.no, sampled$detection.no,
+     xlab = "Manual count",
+     ylab = "BirdNET count",
+     main = "Manual vs BirdNET detections")
+abline(lm(detection.no ~ manual.detection.no, data = sampled)) #Linear model
+abline(0, 1, col = "red", lwd = 2) #If the relationship was perfectly correlated 
+points(top_outliers$manual.detection.no,
+       top_outliers$detection.no,
+       col = "blue", pch = 19)
+legend("topleft",
+       legend = c("All files", "Largest deviations"),
+       pch = c(1, 19),
+       col = c("black", "blue"))
+
+#Final plot used in dissertation using ggplot 
+count <- ggplot(sampled, aes(x = manual.detection.no, y = detection.no)) +
+  geom_point(aes(color = "All files"), size = 2) +
+  geom_point(data = top_outliers,
+             aes(x = manual.detection.no, y = detection.no, color = "Largest deviations"),
+             size = 2) +
+  geom_smooth(method = "lm", colour = "black", se = FALSE) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_continuous(
+    name = "Manual Count",
+    breaks = seq(0, max(sampled$manual.detection.no, na.rm = TRUE), by = 20)
+  ) +
+  scale_y_continuous(
+    name = "BirdNET Model Count",
+    breaks = pretty(sampled$detection.no)
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c("All files" = "black", "Largest deviations" = "blue")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 12),
+    axis.text  = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    legend.position = c(0,1),
+    legend.justification = c(0, 1),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.key = element_rect(fill = "white", color = NA))
+
+```
+
+#### Step 5: Extract time of first call/time of first arrival
+
+```{r Extract Time of First Arrival}
+#Need to first create a night column because my data points cross midnight
+detections <- detections %>%
+  mutate(
+    #Combine date + time into a datetime
+    datetime = ymd_hms(paste(UTC.Date, UTC.Time)),
+    
+    #Extract hour
+    hour = hour(datetime),
+    
+    #Night begins at 22:00; hours < 12 considered the early morning of the same night
+    Night = ifelse(hour >= 21, UTC.Date, UTC.Date-1))
+
+#Convert night to date as it is numeric rn 
+detections$Night <- as.Date(detections$Night)
+
+#Extract the first detection per night
+first_detection_per_night <- detections %>%
+  arrange(Night, datetime) %>%
+  group_by(Night) %>%
+  filter(detection.no > 1) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+#Save to directory
+write.csv(first_detection_per_night, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/first_detection_per_night.csv", row.names = FALSE)
+```
+
+#### Step 6: How well does BirdNET detect time of first call?
+
+```{r Time of First Call - Comparison of Manual vs Automated BirdNET detections}
+############## Get a random  sample of BirdNET files for manual counts
+#Read in the csv that has time of arrival w the rest of the data
+arrival<- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/first_detection_per_night.csv")
+
+#Removd NAs (where we dont have time of arrival data)
+samplearrival <- subset(arrival,!is.na(Time.of.first.arrival))
+
+#Obtain random sample of 10
+samplearrival <- samplearrival[sample(nrow(samplearrival), 10), ]
+
+#Save as csv for counting manually (outside of R)
+write.csv(samplearrival, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/samplearrival.csv", row.names = FALSE)
+
+#Read in csv with my manual and automated time of arrival 
+samplearrival <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/tests/manualarrival/samplearrival.csv")
+
+#Order in which the time is in the file (hour:min:sec)
+orders <- c("H:M:S")
+
+#Function that safely processes the time depending on the format 
+parse_time_safe <- function(x) {
+  #Return POSIXct or NA
+  #First try hms() (time-only), then parse_date_time with multiple orders
+  out <- suppressWarnings(hms::as_hms(x))
+  if (all(is.na(out))) {
+    out2 <- suppressWarnings(parse_date_time(x, orders = orders, tz = "UTC"))
+    # If parse_date_time returns date-times, return them
+    if (all(is.na(out2))) return(NA)
+    return(out2)
+  } else {
+    return(out)
+  }
+}
+
+#Apply parse_date_time directly and keep POSIXct result:
+parsed_manual <- suppressWarnings(parse_date_time(samplearrival$Manual.Time.of.Arrival, orders = orders, tz = "UTC"))
+parsed_bird <- suppressWarnings(parse_date_time(samplearrival$Time.of.first.arrival, orders = orders, tz = "UTC"))
+
+#If your values are time-of-day only, parse_date_time will parse them to today + time.
+#Inspect parse success rate:
+cat("Manual parsed NAs:", sum(is.na(parsed_manual)), " / ", length(parsed_manual), "\n")
+cat("BirdNET parsed NAs:", sum(is.na(parsed_bird)), " / ", length(parsed_bird), "\n")
+
+#Convert parsed values to minutes since midnight
+to_minutes <- function(dt) {
+  if (inherits(dt, "Period") || inherits(dt, "difftime")) {
+    return(as.numeric(dt) / 60)
+  }
+  # If POSIXct, extract hour/minute/second
+  h <- hour(dt)
+  m <- minute(dt)
+  s <- second(dt)
+  # For NA dt this yields NA components and therefore NA total
+  return(h*60 + m + s/60)
+}
+
+manual_sec <- to_minutes(parsed_manual)
+bird_sec   <- to_minutes(parsed_bird)
+
+#Combine rows
+df <- data.frame(manual_sec = manual_sec, bird_sec = bird_sec)
+
+#Plot
+arrival <- if (nrow(nooutlier) > 0) {
+  
+  ggplot(nooutlier, aes(x = manual_sec, y = bird_sec)) +
+    geom_point(size = 2) +
+    geom_abline(slope = 1, intercept = 0, color = "red") +  # 1:1 line
+    geom_smooth(method = "lm", se = FALSE, color = "black") +  # linear model
+    labs(
+      x = "Manual (minutes since midnight)",
+      y = "BirdNET Model (minutes since midnight)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text  = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.position = c(0,1),
+      legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "white", color = "black"),
+      legend.key = element_rect(fill = "white", color = NA)
+    )
+  
+} else {
+  stop("No valid (non-NA) parsed times found for both columns. Check formats and parsing.")
+}
+
+```
+
+#### Step 7: Model vocal activity with light/ship data
+
+```{r Housekeeping}
+#Load data
+vocalcount <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Analysis/analysis/data/VocalDetections.csv")
+  
+#Adding back midnight time stamps
+vocalcount$POSIXct <- as.POSIXct(
+    ifelse(nchar(as.character(vocalcount$POSIXct)) == 10,
+           paste(vocalcount$POSIXct, "00:00:00"),
+           as.character(vocalcount$POSIXct)),
+    format="%Y-%m-%d %H:%M:%S")
+
+#Combine with ship data ship 
+ship <- read.csv("data/shipwide.csv")
+
+#Adding back midnight time stamps and POSIXct
+ship$POSIXct <- as.POSIXct(
+  ifelse(nchar(as.character(ship$POSIXct)) == 10,
+         paste(ship$POSIXct, "00:00:00"),
+         as.character(ship$POSIXct)),
+  format="%Y-%m-%d %H:%M:%S")
+
+#Bind with vocal detections
+vocalcount <- vocalcount %>%
+  inner_join(ship, by = "POSIXct")
+
+colnames(vocalcount)
+```
+
+```{r Random and Fixed Effects Creation }
+############ Days From Start 
+#Night of ID already created above 
+vocalcount$days_from_start <-as.numeric(as.Date(vocalcount$night.of) - min(as.Date(vocalcount$night.of), na.rm = TRUE))
+
+############ Hours Since Midnight 
+vocalcount$hours_since_midnight <- hour(vocalcount$POSIXct) + minute(vocalcount$POSIXct)/60 + second(vocalcount$POSIXct)/3600
+```
+
+```{r Model Fitting - Including Natural Illumination}
+#Model - zero inflated data, negative binomial with log link 
+glmvocal <- glmmTMB(detection.no ~ no.ships + logcdm2.x + logillumination.x + days_from_start + hours_since_midnight + (1 | night.of),
+  ziformula = ~1,
+  family = nbinom2,
+  data = vocalcount)
+summary(glmvocal)
+
+#Prediction data for cdm
+cdm_all <- data.frame(
+  logcdm2.x = seq(min(vocalcount$logcdm2.x, na.rm = TRUE),
+                  max(vocalcount$logcdm2.x, na.rm = TRUE),
+                  length.out = 100),
+  no.ships = mean(vocalcount$no.ships, na.rm = TRUE),
+  logillumination.x = mean(vocalcount$logillumination.x, na.rm = TRUE),
+  days_from_start = mean(vocalcount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(vocalcount$hours_since_midnight, na.rm = TRUE))
+
+#Prediction data for illumination
+nat_all <- data.frame(
+  logillumination.x = seq(min(vocalcount$logillumination.x, na.rm = TRUE),
+                          max(vocalcount$logillumination.x, na.rm = TRUE),
+                          length.out = 100),
+  no.ships = mean(vocalcount$no.ships, na.rm = TRUE),
+  logcdm2.x = mean(vocalcount$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(vocalcount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(vocalcount$hours_since_midnight, na.rm = TRUE))
+
+#Prediction data for ships
+ship_all <- data.frame(
+  no.ships = seq(min(vocalcount$no.ships, na.rm = TRUE),
+                 max(vocalcount$no.ships, na.rm = TRUE),
+                 length.out = 100),
+  logillumination.x = mean(vocalcount$logillumination.x, na.rm = TRUE),
+  logcdm2.x = mean(vocalcount$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(vocalcount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(vocalcount$hours_since_midnight, na.rm = TRUE))
+
+#Predict Number of Ships
+predships <- ggpredict(glmvocal, terms = "no.ships")
+plot(predships)
+shipplot1 <- ggplot() +
+  geom_point(data = vocalcount,
+             aes(x = no.ships, y = detection.no),
+             size = 1.5) +
+  geom_line(data = predships,
+            aes(x = x, y = predicted),
+            color = "blue", linewidth = 1) +
+  geom_ribbon(data = predships,
+              aes(x = x,
+                  ymin = conf.low,
+                  ymax = conf.high),
+              alpha = 0.2) +
+  scale_x_continuous(
+    name = "Number of Ships",
+    breaks = seq(0, max(vocalcount$no.ships, na.rm = TRUE))) +
+  scale_y_continuous(
+    name = expression("Number of Shearwater Calls")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 12), 
+    axis.title.x = element_text(margin = margin(t = 14)), 
+    axis.title.y = element_text(margin = margin(r = 14)))
+
+#Prediction grid for cdm2
+cdm_all <- data.frame(
+  logcdm2.x = seq(min(vocalcount$logcdm2.x, na.rm = TRUE),
+                  max(vocalcount$logcdm2.x, na.rm = TRUE),
+                  length.out = 200),
+  no.ships = mean(vocalcount$no.ships, na.rm = TRUE),
+  logillumination.x = mean(vocalcount$logillumination.x, na.rm = TRUE),
+  days_from_start = mean(vocalcount$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(vocalcount$hours_since_midnight, na.rm = TRUE),
+  night.of = vocalcount$night.of[1])
+pr <- predict(glmvocal, newdata = cdm_all, type = "response", re.form = NA, se.fit = TRUE)
+cdm_all$predicted <- pr$fit
+cdm_all$conf.low  <- pr$fit - 1.96 * pr$se.fit
+cdm_all$conf.high <- pr$fit + 1.96 * pr$se.fit
+
+#Plot cd/m2
+cdmplot1 <- ggplot() +
+  geom_point(data = vocalcount,
+             aes(x = logcdm2.x, y = detection.no),
+             size = 1.5) +
+  geom_line(data = cdm_all,
+            aes(x = logcdm2.x , y = predicted),
+            color = "blue", linewidth = 1) +
+  geom_ribbon(data = cdm_all,
+              aes(x = logcdm2.x,
+                  ymin = conf.low,
+                  ymax = conf.high),
+              alpha = 0.2) +
+  scale_x_continuous(
+    name = "Logcdm2",
+    breaks = seq(0, max(vocalcount$logcdm2.x, na.rm = TRUE))) +
+  scale_y_continuous(
+    name = expression("Number of Shearwater Calls")) +
+  coord_cartesian(ylim = c(0,120))+
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 15),
+    axis.text  = element_text(size = 12), 
+    axis.title.x = element_text(margin = margin(t = 14)), 
+    axis.title.y = element_text(margin = margin(r = 14)))
+cdmplot1
+
+```
+
+```{r Model Fitting - Excluding Natural Illumination}
+#Filtering data
+#Filter to remove when natural illuminance is above 0
+filtered <- vocalcount %>%
+  filter(illumination.x <= 0)
+
+#Model fit
+filvocalglm <- glmer.nb(detection.no ~ no.ships + logcdm2.x + days_from_start + hours_since_midnight + (1 | night.of), data = filtered)
+summary(filvocalglm)
+Anova(filvocalglm, type = "II")
+
+#Create prediction data for cdm
+cdm_new <- data.frame(
+  logcdm2.x = seq(min(filtered$logcdm2.x, na.rm = TRUE),
+                  max(filtered$logcdm2.x, na.rm = TRUE),
+                  length.out = 100),
+  no.ships = mean(filtered$no.ships, na.rm = TRUE),
+  days_from_start = mean(filtered$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(filtered$hours_since_midnight, na.rm = TRUE))
+
+#Create prediction data for ship
+ship_new <- data.frame(
+  no.ships = seq(min(filtered$no.ships, na.rm = TRUE),
+                 max(filtered$no.ships, na.rm = TRUE),
+                 length.out = 100),
+  logcdm2.x = mean(filtered$logcdm2.x, na.rm = TRUE),
+  days_from_start = mean(filtered$days_from_start, na.rm = TRUE),
+  hours_since_midnight = mean(filtered$hours_since_midnight, na.rm = TRUE))
+
+#Predict for cdm
+cdm_new$fit_link <- predict(filvocalglm, cdm_new, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logcdm2.x + days_from_start + hours_since_midnight, cdm_new)
+V <- vcov(filvocalglm)
+cdm_new$se_link <- sqrt(diag(X %*% V %*% t(X)))
+cdm_new$lwr <- exp(cdm_new$fit_link - 1.96 * cdm_new$se_link)
+cdm_new$upr <- exp(cdm_new$fit_link + 1.96 * cdm_new$se_link)
+cdm_new$pred <- exp(cdm_new$fit_link)
+
+#Predict for ship
+ship_new$fit_link <- predict(filvocalglm, ship_new, type = "link", re.form = NA)
+X <- model.matrix(~ no.ships + logcdm2.x + days_from_start + hours_since_midnight, ship_new)
+V <- vcov(filvocalglm)
+ship_new$se_link <- sqrt(diag(X %*% V %*% t(X)))
+ship_new$lwr <- exp(ship_new$fit_link - 1.96 * ship_new$se_link)
+ship_new$upr <- exp(ship_new$fit_link + 1.96 * ship_new$se_link)
+ship_new$pred <- exp(ship_new$fit_link)
+
+#Plot cd/m2
+cdmplot2 <- ggplot(filtered, aes(x = logcdm2.x, y = detection.no)) +
+  geom_point() +
+  geom_line(data = cdm_new, aes(x = logcdm2.x, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = cdm_new,
+              aes(x = logcdm2.x, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwater Calls",
+    breaks = seq(0, max(filtered$detection.no, na.rm = TRUE), by = 10))+
+  coord_cartesian(ylim = c(0, 30)) +
+  scale_x_continuous(
+    name = expression("Sky Brightness (log(" * cd/m^2 * "))")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+cdmplot2
+
+#Plot ship 
+shipplot2 <- ggplot(filtered, aes(x = no.ships, y = detection.no)) +
+  geom_point() +
+  geom_line(data = ship_new, aes(x = no.ships, y = pred),
+            linewidth = 1, colour = "blue") +
+  geom_ribbon(data = ship_new,
+              aes(x = no.ships, ymin = lwr, ymax = upr),
+              inherit.aes = FALSE,
+              alpha = 0.2) +
+  scale_y_continuous(
+    name = "Number of Shearwater Calls",
+    breaks = seq(0, max(filtered$detection.no, na.rm = TRUE), by = 10))+
+  coord_cartesian(ylim = c(0, 30)) +
+  scale_x_continuous(
+    name = expression("Number of Ships")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text  = element_text(size = 13), 
+    axis.title.x = element_text(margin = margin(t = 12)), 
+    axis.title.y = element_text(margin = margin(r = 12)))
+shipplot2
+```

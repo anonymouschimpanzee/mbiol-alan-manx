@@ -1,0 +1,349 @@
+---
+title: "Objective4"
+output: html_document
+date: "2026-04-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This file explores Objective 4 of the project: To evaluate whether shearwater behaviour varies within a night in response to short-term fluctuations in light levels. The file contains processing, analyses and plotting used for the final project write up.
+
+## **Housekeeping** 
+
+```{r Install and Load Packages}
+
+#General
+require(hms) #Time zone and handling times
+require(dplyr) 
+require(lubridate)
+require(tidyverse)
+require(purrr)
+require(suncalc) #Calculates sun and moon elevation, rise and set
+require(stringr)
+
+#Plots
+require(ggplot2) 
+require(patchwork) #Compiling plots
+
+#Models
+require(MASS) #Predictions of linear models (glm.nb)
+require(lme4) #Fit linear and generalised linear mixed models (glmer.nb)
+require(ggfortify) #Plotting of statistics/inspecting residuals
+require(car)
+
+#Sound file processing 
+require(tuneR)
+require(seewave)
+```
+
+## Hypothesis 9
+
+Shearwaters wait for the moon to set before arriving on the colony.
+
+#### Step 1: Extract time of first call/time of first arrival
+
+```{r Extract Time of First Arrival}
+#Load data 
+detections <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/Detections.csv")
+
+#Need to first create a night column because my data points cross midnight
+detections <- detections %>%
+  mutate(
+    #Combine date + time into a datetime
+    datetime = ymd_hms(paste(UTC.Date, UTC.Time)),
+    
+    #Extract hour
+    hour = hour(datetime),
+    
+    #Night begins at 22:00; hours < 12 considered the early morning of the same night
+    Night = ifelse(hour >= 21, UTC.Date, UTC.Date-1))
+
+#Convert night to date as it is numeric rn 
+detections$Night <- as.Date(detections$Night)
+
+#Extract the first detection per night
+first_detection_per_night <- detections %>%
+  arrange(Night, datetime) %>%
+  group_by(Night) %>%
+  filter(detection.no > 1) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+#Save to directory
+write.csv(first_detection_per_night, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/first_detection_per_night.csv", row.names = FALSE)
+```
+
+#### Step 2: Test how well does BirdNET detect time of first call? 
+
+```{r Time of First Call - Comparison of Manual vs Automated BirdNET detections}
+############## Get a random  sample of BirdNET files for manual counts
+#Read in the csv that has time of arrival w the rest of the data
+arrival <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/first_detection_per_night.csv")
+
+#Removd NAs (where we dont have time of arrival data)
+samplearrival <- subset(arrival,!is.na(Time.of.first.arrival))
+
+#Obtain random sample of 10
+samplearrival <- samplearrival[sample(nrow(samplearrival), 10), ]
+
+#Save as csv for counting manually (outside of R)
+write.csv(samplearrival, "~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/samplearrival.csv", row.names = FALSE)
+
+#Read in csv with my manual and automated time of arrival 
+samplearrival <- read.csv("~/Library/CloudStorage/OneDrive-Nexus365/4th Year 2025-2026/Data/Audiomoth files/tests/manualarrival/samplearrival.csv")
+
+#Order in which the time is in the file (hour:min:sec)
+orders <- c("H:M:S")
+
+#Function that safely processes the time depending on the format 
+parse_time_safe <- function(x) {
+  #Return POSIXct or NA
+  #First try hms() (time-only), then parse_date_time with multiple orders
+  out <- suppressWarnings(hms::as_hms(x))
+  if (all(is.na(out))) {
+    out2 <- suppressWarnings(parse_date_time(x, orders = orders, tz = "UTC"))
+    # If parse_date_time returns date-times, return them
+    if (all(is.na(out2))) return(NA)
+    return(out2)
+  } else {
+    return(out)
+  }
+}
+
+#Apply parse_date_time directly and keep POSIXct result:
+parsed_manual <- suppressWarnings(parse_date_time(samplearrival$Manual.Time.of.Arrival, orders = orders, tz = "UTC"))
+parsed_bird <- suppressWarnings(parse_date_time(samplearrival$Time.of.first.arrival, orders = orders, tz = "UTC"))
+
+#If your values are time-of-day only, parse_date_time will parse them to today + time.
+#Inspect parse success rate:
+cat("Manual parsed NAs:", sum(is.na(parsed_manual)), " / ", length(parsed_manual), "\n")
+cat("BirdNET parsed NAs:", sum(is.na(parsed_bird)), " / ", length(parsed_bird), "\n")
+
+#Convert parsed values to minutes since midnight
+to_minutes <- function(dt) {
+  if (inherits(dt, "Period") || inherits(dt, "difftime")) {
+    return(as.numeric(dt) / 60)
+  }
+  # If POSIXct, extract hour/minute/second
+  h <- hour(dt)
+  m <- minute(dt)
+  s <- second(dt)
+  # For NA dt this yields NA components and therefore NA total
+  return(h*60 + m + s/60)
+}
+
+manual_sec <- to_minutes(parsed_manual)
+bird_sec   <- to_minutes(parsed_bird)
+
+#Combine rows
+df <- data.frame(manual_sec = manual_sec, bird_sec = bird_sec)
+
+#Plot
+arrival <- if (nrow(nooutlier) > 0) {
+  
+  ggplot(nooutlier, aes(x = manual_sec, y = bird_sec)) +
+    geom_point(size = 2) +
+    geom_abline(slope = 1, intercept = 0, color = "red") +  # 1:1 line
+    geom_smooth(method = "lm", se = FALSE, color = "black") +  # linear model
+    labs(
+      x = "Manual (minutes since midnight)",
+      y = "BirdNET Model (minutes since midnight)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text  = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.position = c(0,1),
+      legend.justification = c(0, 1),
+      legend.background = element_rect(fill = "white", color = "black"),
+      legend.key = element_rect(fill = "white", color = NA)
+    )
+  
+} else {
+  stop("No valid (non-NA) parsed times found for both columns. Check formats and parsing.")
+}
+
+```
+
+#### Step 3: Convert dates into moon cycles 
+
+```{r}
+#Split data into moon cyles (time of night when moon is at its highest and therefore brightest for each moon cycle)
+#Get moon illumination info
+moon <- getMoonIllumination(date = data$UTC.Date)
+
+#PhaseNames by the phase
+phase_name <- function(p) {
+  if (p < 0.0625 || p >= 0.9375) return("New Moon")
+  if (p < 0.1875) return("Waxing Crescent")
+  if (p < 0.3125) return("First Quarter")
+  if (p < 0.4375) return("Waxing Gibbous")
+  if (p < 0.5625) return("Full Moon")
+  if (p < 0.6875) return("Waning Gibbous")
+  if (p < 0.8125) return("Last Quarter")
+  return("Waning Crescent")
+}
+data$moonPhaseName <- vapply(moon$phase, phase_name, character(1))
+
+#Get moon rise and set 
+data$UTC.Date <- as.Date(data$UTC.Date, format = "%Y-%m-%d")
+lat <- 51.737449
+lon <- -5.287829
+moon_times <- data %>%
+  distinct(UTC.Date) %>%
+  mutate(
+    times = map(UTC.Date, ~ getMoonTimes(.x, lat = lat, lon = lon)),
+    moonrise = map(times, "rise"),
+    moonset  = map(times, "set")
+  ) %>%
+  select(-times)
+
+data <- data %>%
+  inner_join(moon_times, by = "UTC.Date")
+
+data$moonset <- as.POSIXct(unlist(data$moonset), origin = "1970-01-01", tz = "UTC")
+
+data$moonrise <- as.POSIXct(unlist(data$moonrise), origin = "1970-01-01", tz = "UTC")
+```
+
+#### Step 4: Fit a model 
+
+```{r Aesthetics}
+#Order labels so they plot in moon cycle order
+data$moonPhaseName <- factor(
+  data$moonPhaseName,
+  levels = rev(c(
+    "New Moon", "Waxing Crescent", "First Quarter",
+    "Waxing Gibbous", "Full Moon",
+    "Waning Gibbous", "Last Quarter",
+    "Waning Crescent",
+    "ALAN")))
+
+#Colours
+phase_cols <- c(
+  "#8DA0CB",
+  "#FFD92F",
+  "#66C2A5",
+  "#FC8D62",
+  "#E78AC3",
+  "#A6D854",
+  "#E5C494",
+  "#B3B3B3")
+
+```
+
+```{r Fixed Effect Creation}
+###### Days from Start 
+data$days_from_start <-as.numeric(as.Date(data$Night) - min(as.Date(data$Night), na.rm = TRUE))
+
+###### Hourse Since Midnight
+data$hour <- as.numeric(substr(data$UTC.Time, 1, 2)) +
+  as.numeric(substr(data$UTC.Time, 4, 5)) / 60 +
+  as.numeric(substr(data$UTC.Time, 7, 8)) / 3600
+```
+
+```{r Model Fitting}
+#Model
+firstcall <- glmmTMB(hour ~ moonPhaseName + days_from_start, family = Gamma(link = "log"), data = data)
+summary(firstcall)
+
+#Pairwise comparisons from the fitted model
+emm <- emmeans(firstcall, ~ moonPhaseName)
+pw <- as.data.frame(pairs(emm, adjust = "tukey"))
+
+#Split "A - B" into two columns for plotting brackets
+pw <- pw %>%
+  separate(contrast, into = c("group1", "group2"), sep = " - ") %>%
+  mutate(
+    p.signif = case_when(
+      p.value <= 0.001 ~ "***",
+      p.value <= 0.01  ~ "**",
+      p.value <= 0.05  ~ "*",
+      TRUE ~ "ns"))
+
+#Set bracket heights
+ymax <- max(data$hour, na.rm = TRUE)
+yrng <- diff(range(data$hour, na.rm = TRUE))
+pw2 <- pw %>%
+  dplyr::filter(
+    group1 %in% c("First Quarter", "Last Quarter"),
+    group2 %in% c("First Quarter", "Last Quarter")
+  ) %>%
+  dplyr::mutate(y.position = 23.8)
+
+#Calc average time of moon set and rise for each moon phase 
+data$set_hour <- as.numeric(format(data$moonset, "%H")) +
+  as.numeric(format(data$moonset, "%M")) / 60 +
+  as.numeric(format(data$moonset, "%S")) / 3600
+data$rise_hour <- as.numeric(format(data$moonrise, "%H")) +
+  as.numeric(format(data$moonrise, "%M")) / 60 +
+  as.numeric(format(data$moonrise, "%S")) / 3600
+
+#Cyclical mean (taking into account crossing midnight)
+data %>%
+  group_by(moonPhaseName) %>%
+  summarise(
+    set_mean = {
+      theta <- set_hour / 24 * 2 * pi
+      mt <- atan2(
+        mean(sin(theta), na.rm = TRUE),
+        mean(cos(theta), na.rm = TRUE))
+      (mt %% (2*pi)) / (2*pi) * 24},
+    rise_mean = {
+      theta <- rise_hour / 24 * 2 * pi
+      mt <- atan2(
+        mean(sin(theta), na.rm = TRUE),
+        mean(cos(theta), na.rm = TRUE))
+      (mt %% (2*pi)) / (2*pi) * 24})
+
+#Use these in geom_segment in ggplot to mark the average moon rise an set times for the moon phases (number are manually taken from this output)
+```
+
+```{r Plot}
+#only plotting Last and First Quarter phases 
+ggplot(data, aes(x = moonPhaseName, y = hour, fill = moonPhaseName)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  scale_fill_manual(values = phase_cols) +
+  #scale_color_manual(values = phase_cols) +
+  scale_x_discrete(name = "Moon Phase", limits = c("First Quarter", "Last Quarter")) +
+  scale_y_continuous(
+    name = "Time of First Call",
+    breaks = seq(21, 24, by = 1),
+    labels = function(x) sprintf("%02d:00", x)) +
+  coord_cartesian(ylim = c(21, 24)) +
+  stat_pvalue_manual(
+    pw2,
+    label = "p.signif",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    size = 7) +
+  geom_segment(
+    aes(x = 0.6, xend = 1.4, y = 23.1, yend = 23.1),
+    linetype = "dashed",
+    color = "#FFD92F",
+    linewidth = 1,
+    inherit.aes = FALSE) +
+  geom_segment(
+    aes(x = 1.6, xend = 2.4, y = 22.6, yend = 22.6),
+    linetype = "dashed",
+    color = "#8DA0CB",
+    linewidth = 1,
+    inherit.aes = FALSE) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_markdown(size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.title.y = element_text(size = 15, margin = margin(r=20)),
+    axis.title.x = element_text(size = 15, margin = margin(t=20)))
+
+```
