@@ -5,7 +5,7 @@ Candidate Number: **1074115**
 **Summary**
 This repository contains code used to process, analyse and plot data used in the project. The files are split up by Objectives 1-4. Within each is step-by-step code detailed in the Methods section of the write-up. 
 
-Reminder of study objectives (and key methods): 
+Reminder of study objectives (and key methods):
 **Objective 1: To evaluate the impact of ships on sky brightness** 
 	⁃	Hypothesis 1: Sky brightness increases with the number of ships present in the area
 	⁃	Hypothesis 2: Sky brightness is inversely related to the distance between ships and the colony, with closer ships increasing sky brightness more (Distance)
